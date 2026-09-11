@@ -29,10 +29,28 @@ test-go: capnp
 test-rs: build
 	cd ./client/rs && cargo test
 
+test-dart: build
+	cd ./client/dart && dart pub get && dart analyze && dart test
+
+# Verify the HttpClient package compiles for the web (no dart:io/dart:ffi
+# leak through the public API).
+test-dart-web: build
+	cd ./client/dart && dart pub get && dart compile js -o build/out/web_main.js example/web_main.dart
+
+# Build an image that contains the Dart SDK and the blobcache daemon binary,
+# then run the Dart client tests inside it.
+build-dart-image:
+	podman build -f client/dart/Dockerfile -t blobcache-dart-test .
+
+test-dart-podman: build-dart-image
+	podman run --rm blobcache-dart-test
+
 test:
 	just test-go
 	just test-rs
 	just test-zig
+	just test-dart
+	just test-dart-web
 
 testv:
 	go test -count=1 -v ./pkg/...
@@ -66,6 +84,9 @@ build-zig:
 
 test-zig: build
 	cd ./client/zig && zig build test --summary all
+
+build-dart:
+	cd ./client/dart && dart pub get && dart analyze
 
 # Installs just the blobcache binary to /usr/bin/blobcache
 install-unix: build
