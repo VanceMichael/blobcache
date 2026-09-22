@@ -202,6 +202,11 @@ func (ls *System) beginTx(ctx context.Context, vol *Volume, params blobcache.TxP
 	// we don't use doRW here because, nothing we do accesses MVCC tables.
 	ba := ls.db.NewIndexedBatch()
 	defer ba.Close()
+	// mark the transaction as active in SYS_TXNS: MVCC reads exclude active
+	// versions, and abort/commit transition the row to failed/removed.
+	if err := ls.txSys.Start(ba, txid); err != nil {
+		return nil, err
+	}
 	if err := putLocalVolumeTxn(ba, vol.lvid, txid); err != nil {
 		return nil, err
 	}
@@ -217,41 +222,124 @@ func (ls *System) beginTx(ctx context.Context, vol *Volume, params blobcache.TxP
 }
 
 // abortMut aborts a mutating transaction.
+//
+// The flow has two independently retryable phases, distinguished by the
+// transaction's row in SYS_TXNS:
+//
+// Phase 1, while the per-volume write lock is held: revoke the volume's
+// active transaction record and mark the transaction as failed. The write
+// lock is released only after this phase has been committed.
+//
+// Phase 2, without the write lock: remove every MVCC row written by the
+// transaction (undoing blob references and cell writes) and finally remove
+// the failed row from the active set.
+//
+// If a storage error interrupts phase 2, a later invocation observes the
+// failed marker, skips phase 1 (so the write lock is never released
+// twice) and retries phase 2. A committed or already removed transaction
+// is left completely untouched.
 func (s *System) abortMut(volID ID, mvid pdb.MVTag) error {
-	if err := func() error {
+	// A missing row means the transaction committed, was already fully
+	// removed, or never existed: its MVCC rows are committed state and must
+	// not be undone, and the write lock must not be touched.
+	active, failed, err := s.txSys.GetState(s.db, mvid)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return nil
+	}
+
+	// Phase 1, while the per-volume write lock is held: revoke the volume's
+	// active transaction record and mark the transaction as failed. If a
+	// previous attempt already completed this phase (failed marker present),
+	// skip it so that the lock is never released twice.
+	needUnlock := false
+	if !failed {
 		ba := s.db.NewIndexedBatch()
-		defer ba.Close()
-		yesActive, err := s.txSys.IsActive(ba, mvid)
+		if err := deleteLocalVolumeTxn(ba, volID, mvid); err != nil {
+			_ = ba.Close()
+			return err
+		}
+		if err := s.txSys.Failure(ba, mvid); err != nil {
+			_ = ba.Close()
+			return err
+		}
+		if err := ba.Commit(nil); err != nil {
+			_ = ba.Close()
+			return err
+		}
+		if err := ba.Close(); err != nil {
+			return err
+		}
+		needUnlock = true
+	}
+	if needUnlock {
+		s.mutVol.Unlock(volID)
+	}
+
+	// Phase 2, without the write lock: remove every MVCC row written by the
+	// transaction (undoing blob references and cell writes) and finally remove
+	// the failed row from the active set. An indexed batch is required because
+	// the blob reference count updates read their previous value first.
+	ba := s.db.NewIndexedBatch()
+	defer ba.Close()
+	if err := undoVolumeBlobs(s.db, ba, volID, mvid); err != nil {
+		return err
+	}
+	if err := pdb.Undo(s.db, ba, dbtab.TID_LOCAL_VOLUME_CELLS, volID.Marshal(nil), mvid); err != nil {
+		return err
+	}
+	if err := s.txSys.RemoveFailed(ba, mvid); err != nil {
+		return err
+	}
+	return ba.Commit(nil)
+}
+
+// undoVolumeBlobs removes all LOCAL_VOLUME_BLOBS rows written by mvid and
+// reverses their effect on the blob reference counts. Each surviving
+// non-tombstone row incremented the reference count when it was created, so
+// removing it decrements the count again. Rows which ended as tombstones
+// already released their count in tombVolumeBlob when they overwrote a
+// non-tombstone row from the same transaction.
+func undoVolumeBlobs(snp pdb.RO, ba *pebble.Batch, volID ID, mvid pdb.MVTag) error {
+	prefix := volID.Marshal(nil)
+	iter, err := snp.NewIter(&pebble.IterOptions{
+		LowerBound: pdb.TKey{TableID: dbtab.TID_LOCAL_VOLUME_BLOBS, Key: append([]byte(nil), prefix...)}.Marshal(nil),
+		UpperBound: pdb.TKey{TableID: dbtab.TID_LOCAL_VOLUME_BLOBS, Key: pdb.PrefixUpperBound(append([]byte(nil), prefix...))}.Marshal(nil),
+		SkipPoint: func(k []byte) bool {
+			mvk, err := pdb.ParseMVKey(k)
+			if err != nil {
+				return true
+			}
+			return mvk.Version != mvid
+		},
+	})
+	if err != nil {
+		return err
+	}
+	defer iter.Close()
+	for iter.First(); iter.Valid(); iter.Next() {
+		k, err := pdb.ParseTKey(iter.Key())
 		if err != nil {
 			return err
 		}
-		if !yesActive {
-			return nil
-		}
-		if err := s.txSys.Failure(ba, mvid); err != nil {
+		v := iter.Value()
+		if err := ba.Delete(k.Marshal(nil), nil); err != nil {
 			return err
 		}
-		return ba.Commit(nil)
-	}(); err != nil {
-		return err
-	}
-	s.mutVol.Unlock(volID)
-
-	if err := func() error {
-		ba := s.db.NewBatch()
-		defer ba.Close()
-		if err := pdb.Undo(s.db, ba, dbtab.TID_LOCAL_VOLUME_BLOBS, volID.Marshal(nil), mvid); err != nil {
-			return err
+		if len(v) > 0 {
+			// volume blob keys are the volume ID followed by the 16 byte
+			// CID prefix; reference counts are keyed on the same prefix.
+			if len(k.Key) < 8+16 {
+				return fmt.Errorf("invalid volume blob key length: %d", len(k.Key))
+			}
+			var cid blobcache.CID
+			copy(cid[:16], k.Key[8:8+16])
+			if _, err := blobRefCountIncr(ba, cid, -1); err != nil {
+				return err
+			}
 		}
-		if err := pdb.Undo(s.db, ba, dbtab.TID_LOCAL_VOLUME_CELLS, volID.Marshal(nil), mvid); err != nil {
-			return err
-		}
-		if err := s.txSys.RemoveFailed(ba, mvid); err != nil {
-			return err
-		}
-		return ba.Commit(nil)
-	}(); err != nil {
-		return err
 	}
 	return nil
 }
@@ -264,6 +352,11 @@ func (s *System) commit(volID ID, mvid pdb.MVTag, links backend.LinkSet) error {
 	defer ba.Close()
 
 	if err := s.putVolumeLinks(ba, mvid, volID, links); err != nil {
+		return err
+	}
+	// revoke the volume's active transaction record before publishing the
+	// new version, while the per-volume write lock is still held.
+	if err := deleteLocalVolumeTxn(ba, volID, mvid); err != nil {
 		return err
 	}
 	if !s.cfg.NoSync {
@@ -490,8 +583,11 @@ func (s *System) load(volID ID, mvid pdb.MVTag, dst *[]byte) error {
 // If any of them do not exist, the operation is a no-op.
 func (s *System) visit(volID ID, mvid pdb.MVTag, cids []blobcache.CID) error {
 	return s.doRW(func(ba *pebble.Batch, excluding func(pdb.MVTag) bool) error {
+		// the current transaction must never exclude its own rows, even
+		// though its MVTag is present in the active set.
+		includingSelf := excludeExcluding(excluding, mvid)
 		for _, cid := range cids {
-			exists, err := volumeBlobExists(ba, volID, cid, excluding)
+			exists, err := volumeBlobExists(ba, volID, cid, includingSelf)
 			if err != nil {
 				return err
 			}
@@ -616,11 +712,28 @@ func setVolumeBlob(ba *pebble.Batch, volID ID, mvid pdb.MVTag, cid blobcache.CID
 
 // unsetVolumeBlob writes an empty value to the LOCAL_VOLUME_BLOBS table.
 // empty values are tombstones, which will eventually be cleaned up by the vacuum process.
+// If the same transaction previously wrote a non-tombstone row at this key,
+// the blob reference added with that row is released, so that aborting the
+// transaction does not leak a reference count.
 func tombVolumeBlob(ba *pebble.Batch, volID ID, mvid pdb.MVTag, cidp [16]byte) error {
 	k := pdb.MVKey{
 		TableID: dbtab.TID_LOCAL_VOLUME_BLOBS,
 		Key:     slices.Concat(volID.Marshal(nil), cidp[:]),
 		Version: mvid,
+	}
+	v, closer, err := ba.Get(k.Marshal(nil))
+	if err != nil && !errors.Is(err, pebble.ErrNotFound) {
+		return err
+	}
+	if closer != nil {
+		defer closer.Close()
+	}
+	if err == nil && len(v) > 0 {
+		var cid blobcache.CID
+		copy(cid[:16], cidp[:])
+		if _, err := blobRefCountIncr(ba, cid, -1); err != nil {
+			return err
+		}
 	}
 	return ba.Set(k.Marshal(nil), nil, nil)
 }

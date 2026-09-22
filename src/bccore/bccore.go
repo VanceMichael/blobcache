@@ -3,6 +3,7 @@ package bccore
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -34,6 +35,23 @@ type queue struct {
 type transaction struct {
 	backend Tx
 	volume  *volume
+
+	// opsMu is held in write mode while the transaction is being sealed,
+	// and in read mode by every operation which has entered the transaction.
+	// Once sealed is set, no new operations may enter, and opsWG is used
+	// to wait for the operations already in flight to exit.
+	opsMu  sync.RWMutex
+	sealed bool
+	opsWG  sync.WaitGroup
+
+	// termMu serializes the terminal transitions: Commit, explicit Abort,
+	// and the reaper Abort used by Drop, Cleanup and Close.
+	// Exactly one of them wins, and done records the unique terminal state.
+	termMu sync.Mutex
+	done   bool
+	// committed is set when the transaction reached the committed terminal state.
+	// A committed transaction must never be aborted by cleanup.
+	committed bool
 }
 
 // System manages objects and handles to those objects
@@ -47,7 +65,7 @@ type System struct {
 	mu      sync.RWMutex
 	volumes map[blobcache.OID]volume
 	queues  map[blobcache.OID]queue
-	txns    map[blobcache.OID]transaction
+	txns    map[blobcache.OID]*transaction
 
 	handles handleSystem
 	setup   singleflight.Group[blobcache.OID, AnyObject]
@@ -101,18 +119,21 @@ func (s *System) Cleanup(ctx context.Context, now time.Time, onDown func(blobcac
 		return h.expiresAt.After(now)
 	})
 
-	// 2. Release resources for transactions which do not have a handle.
+	// 2. Terminate transactions which no longer have a handle.
+	// Each transaction runs the convergent termination flow:
+	// seal, wait for in-flight operations, abort the backend, and only then
+	// remove the core transaction state. A failure for one transaction is
+	// retained for a later retry and does not prevent other transactions
+	// from being cleaned up.
 	logctx.Info(ctx, "cleaning up transactions")
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	for oid := range s.txns {
-		if !s.handles.isAlive(oid) {
-			delete(s.txns, oid)
-		}
+	if err := s.reapTransactions(ctx); err != nil {
+		logctx.Error(ctx, "reaping transactions", zap.Error(err))
 	}
 
 	// 3. Release resources for mounted volumes which do not have a handle.
 	logctx.Info(ctx, "cleaning up volumes")
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	var ret []blobcache.OID
 	for oid := range s.volumes {
 		if !s.handles.isAlive(oid) {
@@ -136,6 +157,51 @@ func (s *System) Cleanup(ctx context.Context, now time.Time, onDown func(blobcac
 		}
 	}
 	return nil
+}
+
+// reapTransactions terminates every transaction without a live handle.
+// The backend Abort is performed without holding s.mu so that slow or
+// failing storage/network calls neither block unrelated operations nor
+// other transactions' cleanup. Transactions whose Abort fails stay in
+// s.txns sealed, so that a later Cleanup or Close can retry them.
+func (s *System) reapTransactions(ctx context.Context) error {
+	s.mu.RLock()
+	orphans := make([]blobcache.OID, 0, len(s.txns))
+	for oid := range s.txns {
+		if !s.handles.isAlive(oid) {
+			orphans = append(orphans, oid)
+		}
+	}
+	s.mu.RUnlock()
+
+	var errs []error
+	for _, oid := range orphans {
+		s.mu.RLock()
+		tx := s.txns[oid]
+		s.mu.RUnlock()
+		if tx == nil {
+			continue
+		}
+		if err := tx.terminate(ctx); err != nil {
+			logctx.Warn(ctx, "aborting transaction during cleanup; it will be retried later",
+				zap.Stringer("tx", oid), zap.Error(err))
+			errs = append(errs, fmt.Errorf("aborting transaction %v: %w", oid, err))
+			continue
+		}
+		s.removeTxIfOrphan(oid)
+	}
+	return errors.Join(errs...)
+}
+
+// removeTxIfOrphan deletes the core transaction state once the backend has
+// confirmed release. It only removes the entry if no new handle points at
+// the transaction.
+func (s *System) removeTxIfOrphan(oid blobcache.OID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.handles.isAlive(oid) {
+		delete(s.txns, oid)
+	}
 }
 
 func (sys *System) Create(ctx context.Context, oid blobcache.OID, x AnyObject, rights blobcache.ActionSet, createdAt time.Time, ttl time.Duration) (blobcache.Handle, error) {
@@ -245,19 +311,25 @@ func (sys *System) resolveVol(x blobcache.Handle) (volume, blobcache.ActionSet, 
 }
 
 // resolveTx looks up the transaction handle from memory.
-func (sys *System) resolveTx(txh blobcache.Handle, touch bool, requires blobcache.ActionSet) (transaction, error) {
+// On success the returned release function MUST be called when the operation
+// has finished touching the transaction. resolveTx refuses to enter a
+// transaction which is sealed for termination or already done, and the
+// release count is what the termination flow waits on before calling Abort.
+func (sys *System) resolveTx(txh blobcache.Handle, touch bool, requires blobcache.ActionSet) (*transaction, func(), error) {
 	sys.mu.RLock()
-	defer sys.mu.RUnlock()
 	oid, rights := sys.handles.Resolve(txh)
 	if rights == 0 {
-		return transaction{}, blobcache.ErrInvalidHandle{Handle: txh}
+		sys.mu.RUnlock()
+		return nil, nil, blobcache.ErrInvalidHandle{Handle: txh}
 	}
 	tx, exists := sys.txns[oid]
 	if !exists {
-		return transaction{}, blobcache.ErrInvalidHandle{Handle: txh}
+		sys.mu.RUnlock()
+		return nil, nil, blobcache.ErrInvalidHandle{Handle: txh}
 	}
 	if rights&requires < requires {
-		return transaction{}, blobcache.ErrPermission{
+		sys.mu.RUnlock()
+		return nil, nil, blobcache.ErrPermission{
 			Handle:   txh,
 			Rights:   rights,
 			Requires: requires,
@@ -266,7 +338,13 @@ func (sys *System) resolveTx(txh blobcache.Handle, touch bool, requires blobcach
 	if touch {
 		sys.handles.KeepAlive(txh, time.Now().Add(DefaultTxTTL))
 	}
-	return tx, nil
+	sys.mu.RUnlock()
+
+	release, err := tx.enterOp()
+	if err != nil {
+		return nil, nil, setErrTxOID(err, oid)
+	}
+	return tx, release, nil
 }
 
 func (sys *System) addVolume(oid blobcache.OID, vol Volume) bool {
@@ -358,21 +436,47 @@ func (sys *System) Share(x blobcache.Handle, mask blobcache.ActionSet) (blobcach
 	return out, nil
 }
 
-// Drop implements blobcache.HandleAPI.Drop
-func (sys *System) Drop(_ context.Context, h blobcache.Handle) error {
+// Drop implements blobcache.HandleAPI.Drop.
+// If the dropped handle was the last handle to a transaction, the
+// transaction is put through the convergent termination flow immediately,
+// rather than waiting for Cleanup: new operations are refused, in-flight
+// operations are allowed to exit, and then the backend is aborted.
+// Drop is best effort: if the backend Abort fails the failure is logged
+// and the sealed transaction stays registered, so that a later periodic
+// Cleanup or Close can retry it without ever blocking the Drop caller.
+func (sys *System) Drop(ctx context.Context, h blobcache.Handle) error {
+	logctx.Info(ctx, "begin", zap.String("method", "Drop"), zap.Stringer("oid", h.OID))
+	defer logctx.Info(ctx, "done", zap.String("method", "Drop"), zap.Stringer("oid", h.OID))
+	sys.mu.Lock()
 	sys.handles.Drop(h)
+	tx, isTx := sys.txns[h.OID]
+	alive := sys.handles.isAlive(h.OID)
+	sys.mu.Unlock()
+	if !isTx || alive {
+		return nil
+	}
+	if err := tx.terminate(ctx); err != nil {
+		logctx.Warn(ctx, "aborting dropped transaction; it will be retried by cleanup",
+			zap.Stringer("tx", h.OID), zap.Error(err))
+		return nil
+	}
+	sys.removeTxIfOrphan(h.OID)
 	return nil
 }
 
-// KeepAlive implements blobcache.HandleAPI.KeepAlive
+// KeepAlive implements blobcache.HandleAPI.KeepAlive.
+// Resolution and extension happen atomically: a handle which expired and
+// entered reclamation cannot be kept alive.
 func (sys *System) KeepAlive(_ context.Context, hs []blobcache.Handle) error {
+	now := time.Now()
+	sys.mu.RLock()
+	defer sys.mu.RUnlock()
 	for _, h := range hs {
 		if _, rights := sys.handles.Resolve(h); rights == 0 {
 			return blobcache.ErrInvalidHandle{Handle: h}
 		}
 
 		var ttl time.Duration
-		sys.mu.RLock()
 		if _, ok := sys.volumes[h.OID]; ok {
 			ttl = DefaultVolumeTTL
 		}
@@ -382,9 +486,10 @@ func (sys *System) KeepAlive(_ context.Context, hs []blobcache.Handle) error {
 		if _, ok := sys.queues[h.OID]; ok {
 			ttl = DefaultQueueTTL
 		}
-		sys.mu.RUnlock()
 
-		sys.handles.KeepAlive(h, time.Now().Add(ttl))
+		if !sys.handles.KeepAlive(h, now.Add(ttl)) {
+			return blobcache.ErrInvalidHandle{Handle: h}
+		}
 	}
 	return nil
 }

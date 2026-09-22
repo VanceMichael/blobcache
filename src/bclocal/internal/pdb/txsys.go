@@ -1,6 +1,7 @@
 package pdb
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -41,8 +42,8 @@ func (txs *TxSys) AllocateTxID() (MVTag, error) {
 	return MVTag(txid), nil
 }
 
-// start marks a transaction as active.
-func (txs *TxSys) start(ba WO, txid MVTag) error {
+// Start marks a transaction as active.
+func (txs *TxSys) Start(ba WO, txid MVTag) error {
 	k := TKey{
 		TableID: txs.table,
 		Key:     binary.BigEndian.AppendUint64(nil, uint64(txid)),
@@ -55,10 +56,14 @@ func (txs *TxSys) Success(ba WO, txid MVTag) error {
 	return ba.Delete(txs.sysTxnKey(nil, txid), nil)
 }
 
+// failedTxValue is the value written by Failure to mark a transaction
+// as aborted but not yet fully cleaned up.
+var failedTxValue = []byte{0x01}
+
 // failure marks a transaction as failed.
 // The transaction stays in the active set.
 func (txs *TxSys) Failure(ba WO, txid MVTag) error {
-	return ba.Set(txs.sysTxnKey(nil, txid), []byte{0x01}, nil)
+	return ba.Set(txs.sysTxnKey(nil, txid), failedTxValue, nil)
 }
 
 // removeFailed removes a failed transaction from the active set.
@@ -71,16 +76,20 @@ func (txs *TxSys) ReadActive(sp RO, dst map[MVTag]struct{}) error {
 	return txs.readActive(sp, dst)
 }
 
-func (txs *TxSys) IsActive(sn RO, txid MVTag) (bool, error) {
-	_, closer, err := sn.Get(txs.sysTxnKey(nil, txid))
+// GetState reports whether a transaction is present in the active set and,
+// when it is, whether it has already been marked failed by a previous
+// abort attempt. A missing row means the transaction either committed or
+// was never started.
+func (txs *TxSys) GetState(sn RO, txid MVTag) (active, failed bool, _ error) {
+	v, closer, err := sn.Get(txs.sysTxnKey(nil, txid))
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
-			return false, nil
+			return false, false, nil
 		}
-		return false, err
+		return false, false, err
 	}
 	defer closer.Close()
-	return closer != nil, nil
+	return true, bytes.Equal(v, failedTxValue), nil
 }
 
 // readActiveSysTxns reads the active transactions

@@ -73,16 +73,21 @@ func (hs *handleSystem) Resolve(h blobcache.Handle) (blobcache.OID, blobcache.Ac
 	return handle.target, handle.rights
 }
 
-func (hs *handleSystem) KeepAlive(h blobcache.Handle, expiresAt time.Time) {
+// KeepAlive extends the expiration of a handle.
+// It returns false if the handle no longer exists, for instance because it
+// expired and was removed by cleanup. In that case the handle is not
+// re-created.
+func (hs *handleSystem) KeepAlive(h blobcache.Handle, expiresAt time.Time) bool {
 	k := handleKey(h)
 	hs.mu.Lock()
 	defer hs.mu.Unlock()
 	handle, exists := hs.handles[k]
 	if !exists {
-		return
+		return false
 	}
 	handle.expiresAt = expiresAt
 	hs.handles[k] = handle
+	return true
 }
 
 func (hs *handleSystem) Inspect(h blobcache.Handle) (handle, bool) {

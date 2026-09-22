@@ -286,14 +286,20 @@ func Compact(sp *pebble.Snapshot, ba *pebble.Batch, tableID TableID, exclude fun
 
 // Undo removes all the rows in a given table with a specific version.
 func Undo(sp RO, ba WO, tid TableID, prefix []byte, mvid MVTag) error {
-	var upperBound []byte
+	// PrefixUpperBound mutates the prefix slice in place, so work on copies
+	// and keep the lower bound independent of the upper bound computation.
+	lowerKey := append([]byte(nil), prefix...)
+	upperKey := PrefixUpperBound(append([]byte(nil), prefix...))
+	var lowerBound, upperBound []byte
 	if len(prefix) == 0 {
+		lowerBound = TableLowerBound(tid)
 		upperBound = TableUpperBound(tid)
 	} else {
-		upperBound = TKey{TableID: tid, Key: PrefixUpperBound(prefix)}.Marshal(nil)
+		lowerBound = TKey{TableID: tid, Key: lowerKey}.Marshal(nil)
+		upperBound = TKey{TableID: tid, Key: upperKey}.Marshal(nil)
 	}
 	iter, err := sp.NewIter(&pebble.IterOptions{
-		LowerBound: TKey{TableID: tid, Key: prefix}.Marshal(nil),
+		LowerBound: lowerBound,
 		UpperBound: upperBound,
 		SkipPoint: func(k []byte) bool {
 			mvk, err := ParseMVKey(k)
@@ -307,7 +313,7 @@ func Undo(sp RO, ba WO, tid TableID, prefix []byte, mvid MVTag) error {
 		return err
 	}
 	defer iter.Close()
-	for iter.Next() {
+	for iter.First(); iter.Valid(); iter.Next() {
 		k, err := ParseTKey(iter.Key())
 		if err != nil {
 			return err

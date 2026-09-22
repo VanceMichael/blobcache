@@ -99,9 +99,9 @@ func (sys *System) BeginTx(ctx context.Context, volh blobcache.Handle, txspec bl
 	txoid := blobcache.RandomOID()
 	sys.mu.Lock()
 	if sys.txns == nil {
-		sys.txns = make(map[blobcache.OID]transaction)
+		sys.txns = make(map[blobcache.OID]*transaction)
 	}
-	sys.txns[txoid] = transaction{
+	sys.txns[txoid] = &transaction{
 		backend: tx,
 		volume:  &vol,
 	}

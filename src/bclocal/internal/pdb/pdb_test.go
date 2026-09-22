@@ -22,7 +22,7 @@ func TestTxSystem(t *testing.T) {
 
 	// mark the transaction as active
 	require.NoError(t, DoRW(db, func(ba *pebble.Batch) error {
-		return txs.start(ba, txid1)
+		return txs.Start(ba, txid1)
 	}))
 	// read the active transactions
 	activeTxns := make(map[MVTag]struct{})

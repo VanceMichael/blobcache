@@ -1,0 +1,1794 @@
+diff --git a/evidence/rubric-report.txt b/evidence/rubric-report.txt
+new file mode 100644
+index 0000000..b9455f6
+--- /dev/null
++++ b/evidence/rubric-report.txt
+@@ -0,0 +1,10 @@
++项目：092109/project-01｜题目：让失联事务释放后端状态｜固定版本：0d8f3f308c3eb04f9b5c450d5773a6be84b22523
++有效轮数：160｜Harness：Trae｜Session：6ab102ea41e3bff58c9cf563｜扫描来源：count-trae-cn-steps.py/latest_turn
++可复现验证：go test -count=1 ./src/bccore ./src/bclocal ./src/bclocal/internal/pdb ./src/bclocal/internal/localvol 通过。
++Rubric ID：1｜状态：通过｜期望行为：事务句柄过期或最后一个副本被 Drop 后，Cleanup 会终止对应后端事务并仅在释放成功后移除核心事务状态。｜实际观察：reapTransactions 对无存活句柄执行 terminate，terminate 先 seal、等待在途操作、调用 backend.Abort，成功后 removeTxIfOrphan 才删除 txns。｜直接证据：src/bccore/bccore.go:167-201；src/bccore/txapi.go:72-113。
++Rubric ID：2｜状态：通过｜期望行为：Cleanup 与 Commit、显式 Abort、KeepAlive 及在途事务操作并发时只有一个终态，不会回滚已提交结果、续活已回收事务或并发调用已关闭后端。｜实际观察：resolveTx 通过 opsMu 拒绝 sealed/done 事务，commit、abort、terminate 由 termMu 串行，Commit 设置 committed 后 terminate 不再 Abort。｜直接证据：src/bccore/bccore.go:318-350；src/bccore/txapi.go:20-113。
++Rubric ID：3｜状态：通过｜期望行为：本地修改事务被清理后会释放每卷写锁并撤销活动事务、MVCC、未提交 blob 与链接影响，同卷下一次修改事务可在有界时间内开始。｜实际观察：localvol.abortMut 先撤销卷活动记录并提交 failed 标记、释放 mutVol，再删除 MVCC 行、回退 blob 引用并移除失败事务；测试覆盖锁释放和后续事务。｜直接证据：src/bclocal/internal/localvol/system.go:224-309；src/bclocal/internal/localvol/abort_test.go:91-205。
++Rubric ID：4｜状态：通过｜期望行为：后端 Abort 失败时事务保留为可重试状态，后续 Cleanup 或 Close 能继续收敛；单个失败不会阻止其他过期事务完成清理。｜实际观察：terminate 失败不设置 done，reapTransactions 保留 txns 并继续处理其他事务，下一次 Cleanup 再次调用 Abort；故障注入测试验证第一次失败后的重试。｜直接证据：src/bccore/bccore.go:167-191；src/bccore/txcleanup_test.go:191-230。
++Rubric ID：5｜状态：未通过｜期望行为：只读、内存、Vault 和远端事务都执行匹配其后端的终止语义，远端错误可观察且不会被误报为已释放。｜实际观察：Drop 在 terminate 返回错误时只记录日志并返回 nil，Cleanup 记录错误后仍返回 nil；调用方收到成功结果而 backend.Abort 失败。｜直接证据：src/bccore/bccore.go:446-464；src/bccore/bccore.go:183-190；src/bclocal/bclocal.go:214-220。｜原因：Drop 和 Cleanup 抑制 Abort 错误。｜影响：远端或 Vault 事务释放失败时用户接口返回成功，释放状态不可观察。｜证据位置：src/bccore/bccore.go:446-464、src/bccore/bccore.go:183-190。
++Rubric ID：6｜状态：未通过｜期望行为：服务 Close 与 AbortAll 会等待或重试尚在回收和在途的事务，返回后不遗留持锁事务、活动记录或仍可操作的旧句柄。｜实际观察：AbortAll 对 terminate 错误只记录日志并继续，函数最后无条件返回 nil；bclocal.Service.Close 随后继续关闭数据库。｜直接证据：src/bccore/txapi.go:419-449；src/bclocal/bclocal.go:176-188。｜原因：AbortAll 未在同一次关闭中重试或传播失败。｜影响：Abort 失败时 Close 返回后仍可保留 sealed transaction，随后数据库已关闭，未完成清理不能再由该关闭流程收敛。｜证据位置：src/bccore/txapi.go:419-449、src/bclocal/bclocal.go:176-188。
++Rubric ID：7｜状态：通过｜期望行为：未过期事务、正常 Commit 与显式 Abort 的现有结果保持兼容，Service、HTTP 和 IPC 的有效调用不因后台清理而回归。｜实际观察：定向 bccore、bclocal 和 pdb 测试全部通过，终态逻辑只拒绝 sealed/done 句柄，正常 Commit/Abort 仍走原 backend API。｜直接证据：go test -count=1 定向命令输出；src/bccore/txapi.go:121-190。
+diff --git a/src/bccore/bccore.go b/src/bccore/bccore.go
+index 2d1aea9..ed00236 100644
+--- a/src/bccore/bccore.go
++++ b/src/bccore/bccore.go
+@@ -3,6 +3,7 @@ package bccore
+ 
+ import (
+ 	"context"
++	"errors"
+ 	"fmt"
+ 	"sync"
+ 	"time"
+@@ -34,6 +35,23 @@ type queue struct {
+ type transaction struct {
+ 	backend Tx
+ 	volume  *volume
++
++	// opsMu is held in write mode while the transaction is being sealed,
++	// and in read mode by every operation which has entered the transaction.
++	// Once sealed is set, no new operations may enter, and opsWG is used
++	// to wait for the operations already in flight to exit.
++	opsMu  sync.RWMutex
++	sealed bool
++	opsWG  sync.WaitGroup
++
++	// termMu serializes the terminal transitions: Commit, explicit Abort,
++	// and the reaper Abort used by Drop, Cleanup and Close.
++	// Exactly one of them wins, and done records the unique terminal state.
++	termMu sync.Mutex
++	done   bool
++	// committed is set when the transaction reached the committed terminal state.
++	// A committed transaction must never be aborted by cleanup.
++	committed bool
+ }
+ 
+ // System manages objects and handles to those objects
+@@ -47,7 +65,7 @@ type System struct {
+ 	mu      sync.RWMutex
+ 	volumes map[blobcache.OID]volume
+ 	queues  map[blobcache.OID]queue
+-	txns    map[blobcache.OID]transaction
++	txns    map[blobcache.OID]*transaction
+ 
+ 	handles handleSystem
+ 	setup   singleflight.Group[blobcache.OID, AnyObject]
+@@ -101,18 +119,21 @@ func (s *System) Cleanup(ctx context.Context, now time.Time, onDown func(blobcac
+ 		return h.expiresAt.After(now)
+ 	})
+ 
+-	// 2. Release resources for transactions which do not have a handle.
++	// 2. Terminate transactions which no longer have a handle.
++	// Each transaction runs the convergent termination flow:
++	// seal, wait for in-flight operations, abort the backend, and only then
++	// remove the core transaction state. A failure for one transaction is
++	// retained for a later retry and does not prevent other transactions
++	// from being cleaned up.
+ 	logctx.Info(ctx, "cleaning up transactions")
+-	s.mu.Lock()
+-	defer s.mu.Unlock()
+-	for oid := range s.txns {
+-		if !s.handles.isAlive(oid) {
+-			delete(s.txns, oid)
+-		}
++	if err := s.reapTransactions(ctx); err != nil {
++		logctx.Error(ctx, "reaping transactions", zap.Error(err))
+ 	}
+ 
+ 	// 3. Release resources for mounted volumes which do not have a handle.
+ 	logctx.Info(ctx, "cleaning up volumes")
++	s.mu.Lock()
++	defer s.mu.Unlock()
+ 	var ret []blobcache.OID
+ 	for oid := range s.volumes {
+ 		if !s.handles.isAlive(oid) {
+@@ -138,6 +159,51 @@ func (s *System) Cleanup(ctx context.Context, now time.Time, onDown func(blobcac
+ 	return nil
+ }
+ 
++// reapTransactions terminates every transaction without a live handle.
++// The backend Abort is performed without holding s.mu so that slow or
++// failing storage/network calls neither block unrelated operations nor
++// other transactions' cleanup. Transactions whose Abort fails stay in
++// s.txns sealed, so that a later Cleanup or Close can retry them.
++func (s *System) reapTransactions(ctx context.Context) error {
++	s.mu.RLock()
++	orphans := make([]blobcache.OID, 0, len(s.txns))
++	for oid := range s.txns {
++		if !s.handles.isAlive(oid) {
++			orphans = append(orphans, oid)
++		}
++	}
++	s.mu.RUnlock()
++
++	var errs []error
++	for _, oid := range orphans {
++		s.mu.RLock()
++		tx := s.txns[oid]
++		s.mu.RUnlock()
++		if tx == nil {
++			continue
++		}
++		if err := tx.terminate(ctx); err != nil {
++			logctx.Warn(ctx, "aborting transaction during cleanup; it will be retried later",
++				zap.Stringer("tx", oid), zap.Error(err))
++			errs = append(errs, fmt.Errorf("aborting transaction %v: %w", oid, err))
++			continue
++		}
++		s.removeTxIfOrphan(oid)
++	}
++	return errors.Join(errs...)
++}
++
++// removeTxIfOrphan deletes the core transaction state once the backend has
++// confirmed release. It only removes the entry if no new handle points at
++// the transaction.
++func (s *System) removeTxIfOrphan(oid blobcache.OID) {
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	if !s.handles.isAlive(oid) {
++		delete(s.txns, oid)
++	}
++}
++
+ func (sys *System) Create(ctx context.Context, oid blobcache.OID, x AnyObject, rights blobcache.ActionSet, createdAt time.Time, ttl time.Duration) (blobcache.Handle, error) {
+ 	if oid == (blobcache.OID{}) {
+ 		return blobcache.Handle{}, fmt.Errorf("cannot create new object with root OID")
+@@ -245,19 +311,25 @@ func (sys *System) resolveVol(x blobcache.Handle) (volume, blobcache.ActionSet,
+ }
+ 
+ // resolveTx looks up the transaction handle from memory.
+-func (sys *System) resolveTx(txh blobcache.Handle, touch bool, requires blobcache.ActionSet) (transaction, error) {
++// On success the returned release function MUST be called when the operation
++// has finished touching the transaction. resolveTx refuses to enter a
++// transaction which is sealed for termination or already done, and the
++// release count is what the termination flow waits on before calling Abort.
++func (sys *System) resolveTx(txh blobcache.Handle, touch bool, requires blobcache.ActionSet) (*transaction, func(), error) {
+ 	sys.mu.RLock()
+-	defer sys.mu.RUnlock()
+ 	oid, rights := sys.handles.Resolve(txh)
+ 	if rights == 0 {
+-		return transaction{}, blobcache.ErrInvalidHandle{Handle: txh}
++		sys.mu.RUnlock()
++		return nil, nil, blobcache.ErrInvalidHandle{Handle: txh}
+ 	}
+ 	tx, exists := sys.txns[oid]
+ 	if !exists {
+-		return transaction{}, blobcache.ErrInvalidHandle{Handle: txh}
++		sys.mu.RUnlock()
++		return nil, nil, blobcache.ErrInvalidHandle{Handle: txh}
+ 	}
+ 	if rights&requires < requires {
+-		return transaction{}, blobcache.ErrPermission{
++		sys.mu.RUnlock()
++		return nil, nil, blobcache.ErrPermission{
+ 			Handle:   txh,
+ 			Rights:   rights,
+ 			Requires: requires,
+@@ -266,7 +338,13 @@ func (sys *System) resolveTx(txh blobcache.Handle, touch bool, requires blobcach
+ 	if touch {
+ 		sys.handles.KeepAlive(txh, time.Now().Add(DefaultTxTTL))
+ 	}
+-	return tx, nil
++	sys.mu.RUnlock()
++
++	release, err := tx.enterOp()
++	if err != nil {
++		return nil, nil, setErrTxOID(err, oid)
++	}
++	return tx, release, nil
+ }
+ 
+ func (sys *System) addVolume(oid blobcache.OID, vol Volume) bool {
+@@ -358,21 +436,47 @@ func (sys *System) Share(x blobcache.Handle, mask blobcache.ActionSet) (blobcach
+ 	return out, nil
+ }
+ 
+-// Drop implements blobcache.HandleAPI.Drop
+-func (sys *System) Drop(_ context.Context, h blobcache.Handle) error {
++// Drop implements blobcache.HandleAPI.Drop.
++// If the dropped handle was the last handle to a transaction, the
++// transaction is put through the convergent termination flow immediately,
++// rather than waiting for Cleanup: new operations are refused, in-flight
++// operations are allowed to exit, and then the backend is aborted.
++// Drop is best effort: if the backend Abort fails the failure is logged
++// and the sealed transaction stays registered, so that a later periodic
++// Cleanup or Close can retry it without ever blocking the Drop caller.
++func (sys *System) Drop(ctx context.Context, h blobcache.Handle) error {
++	logctx.Info(ctx, "begin", zap.String("method", "Drop"), zap.Stringer("oid", h.OID))
++	defer logctx.Info(ctx, "done", zap.String("method", "Drop"), zap.Stringer("oid", h.OID))
++	sys.mu.Lock()
+ 	sys.handles.Drop(h)
++	tx, isTx := sys.txns[h.OID]
++	alive := sys.handles.isAlive(h.OID)
++	sys.mu.Unlock()
++	if !isTx || alive {
++		return nil
++	}
++	if err := tx.terminate(ctx); err != nil {
++		logctx.Warn(ctx, "aborting dropped transaction; it will be retried by cleanup",
++			zap.Stringer("tx", h.OID), zap.Error(err))
++		return nil
++	}
++	sys.removeTxIfOrphan(h.OID)
+ 	return nil
+ }
+ 
+-// KeepAlive implements blobcache.HandleAPI.KeepAlive
++// KeepAlive implements blobcache.HandleAPI.KeepAlive.
++// Resolution and extension happen atomically: a handle which expired and
++// entered reclamation cannot be kept alive.
+ func (sys *System) KeepAlive(_ context.Context, hs []blobcache.Handle) error {
++	now := time.Now()
++	sys.mu.RLock()
++	defer sys.mu.RUnlock()
+ 	for _, h := range hs {
+ 		if _, rights := sys.handles.Resolve(h); rights == 0 {
+ 			return blobcache.ErrInvalidHandle{Handle: h}
+ 		}
+ 
+ 		var ttl time.Duration
+-		sys.mu.RLock()
+ 		if _, ok := sys.volumes[h.OID]; ok {
+ 			ttl = DefaultVolumeTTL
+ 		}
+@@ -382,9 +486,10 @@ func (sys *System) KeepAlive(_ context.Context, hs []blobcache.Handle) error {
+ 		if _, ok := sys.queues[h.OID]; ok {
+ 			ttl = DefaultQueueTTL
+ 		}
+-		sys.mu.RUnlock()
+ 
+-		sys.handles.KeepAlive(h, time.Now().Add(ttl))
++		if !sys.handles.KeepAlive(h, now.Add(ttl)) {
++			return blobcache.ErrInvalidHandle{Handle: h}
++		}
+ 	}
+ 	return nil
+ }
+diff --git a/src/bccore/handles.go b/src/bccore/handles.go
+index d8eb69b..de37f3e 100644
+--- a/src/bccore/handles.go
++++ b/src/bccore/handles.go
+@@ -73,16 +73,21 @@ func (hs *handleSystem) Resolve(h blobcache.Handle) (blobcache.OID, blobcache.Ac
+ 	return handle.target, handle.rights
+ }
+ 
+-func (hs *handleSystem) KeepAlive(h blobcache.Handle, expiresAt time.Time) {
++// KeepAlive extends the expiration of a handle.
++// It returns false if the handle no longer exists, for instance because it
++// expired and was removed by cleanup. In that case the handle is not
++// re-created.
++func (hs *handleSystem) KeepAlive(h blobcache.Handle, expiresAt time.Time) bool {
+ 	k := handleKey(h)
+ 	hs.mu.Lock()
+ 	defer hs.mu.Unlock()
+ 	handle, exists := hs.handles[k]
+ 	if !exists {
+-		return
++		return false
+ 	}
+ 	handle.expiresAt = expiresAt
+ 	hs.handles[k] = handle
++	return true
+ }
+ 
+ func (hs *handleSystem) Inspect(h blobcache.Handle) (handle, bool) {
+diff --git a/src/bccore/txapi.go b/src/bccore/txapi.go
+index b4e70d8..6158ba5 100644
+--- a/src/bccore/txapi.go
++++ b/src/bccore/txapi.go
+@@ -13,13 +13,116 @@ import (
+ // This next section implements blobcache.TxAPI
+ var _ blobcache.TxAPI = &System{}
+ 
++// enterOp registers an in-flight operation on the transaction.
++// Operations are refused once the transaction is sealed or done.
++// The returned function must be called when the operation exits.
++func (tx *transaction) enterOp() (func(), error) {
++	tx.opsMu.RLock()
++	if tx.sealed || tx.done {
++		tx.opsMu.RUnlock()
++		return nil, blobcache.ErrTxDone{}
++	}
++	tx.opsWG.Add(1)
++	tx.opsMu.RUnlock()
++	return tx.opsWG.Done, nil
++}
++
++// seal refuses new operations and waits for the operations already inside
++// the transaction to exit. It is idempotent.
++func (tx *transaction) seal() {
++	tx.opsMu.Lock()
++	tx.sealed = true
++	tx.opsMu.Unlock()
++	tx.opsWG.Wait()
++}
++
++// unseal reopens the transaction for operations after a terminal backend
++// call failed and the transaction remains usable.
++func (tx *transaction) unseal() {
++	tx.opsMu.Lock()
++	tx.sealed = false
++	tx.opsMu.Unlock()
++}
++
++// commit drives the transaction to its committed terminal state.
++// commit serializes against abort and the reaper terminate, so the
++// transaction ends in exactly one terminal state. A failed backend Commit
++// leaves the transaction usable, preserving the previous retry behavior.
++func (tx *transaction) commit(ctx context.Context) error {
++	tx.termMu.Lock()
++	defer tx.termMu.Unlock()
++	if tx.done {
++		return blobcache.ErrTxDone{}
++	}
++	tx.seal()
++	if err := tx.backend.Commit(ctx); err != nil {
++		tx.unseal()
++		return err
++	}
++	tx.done = true
++	tx.committed = true
++	return nil
++}
++
++// abort drives the transaction to its aborted terminal state in response
++// to an explicit Abort call. A failed backend Abort leaves the transaction
++// sealed=false and usable, preserving the previous retry behavior.
++func (tx *transaction) abort(ctx context.Context) error {
++	tx.termMu.Lock()
++	defer tx.termMu.Unlock()
++	if tx.done {
++		// Abort after Commit/Abort is a no-op in every backend.
++		return nil
++	}
++	tx.seal()
++	if err := tx.backend.Abort(ctx); err != nil {
++		tx.unseal()
++		return err
++	}
++	tx.done = true
++	return nil
++}
++
++// terminate is the reaper side of the termination flow, shared by
++// handle expiry in Cleanup, the last handle Drop, and Close/AbortAll.
++// It seals the transaction, waits for in-flight operations to exit, and
++// then aborts the backend. If the backend Abort fails the transaction
++// stays sealed and present, so that a later Cleanup or Close can retry;
++// a transaction which reached the committed state is never rolled back.
++func (tx *transaction) terminate(ctx context.Context) error {
++	tx.seal()
++	tx.termMu.Lock()
++	defer tx.termMu.Unlock()
++	if tx.done {
++		return nil
++	}
++	if err := tx.backend.Abort(ctx); err != nil {
++		return err
++	}
++	tx.done = true
++	return nil
++}
++
++// finishAfterTerminal drops the handle used to end the transaction and,
++// if it was the last handle, removes the core transaction state now that
++// the backend has confirmed release.
++func (sys *System) finishAfterTerminal(h blobcache.Handle) {
++	sys.mu.Lock()
++	defer sys.mu.Unlock()
++	sys.handles.Drop(h)
++	if !sys.handles.isAlive(h.OID) {
++		delete(sys.txns, h.OID)
++	}
++}
++
+ func (sys *System) InspectTx(ctx context.Context, txh blobcache.Handle) (*blobcache.TxInfo, error) {
+ 	logctx.Debug(ctx, "begin", zap.String("method", "InspectTx"), zap.Stringer("oid", txh.OID))
+ 	defer logctx.Debug(ctx, "done", zap.String("method", "InspectTx"), zap.Stringer("oid", txh.OID))
+-	tx, err := sys.resolveTx(txh, true, blobcache.Action_TX_INSPECT)
++	tx, release, err := sys.resolveTx(txh, true, blobcache.Action_TX_INSPECT)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	defer release()
+ 	params := tx.backend.Params()
+ 	return &blobcache.TxInfo{
+ 		ID:       txh.OID,
+@@ -33,19 +136,18 @@ func (sys *System) InspectTx(ctx context.Context, txh blobcache.Handle) (*blobca
+ func (sys *System) Commit(ctx context.Context, txh blobcache.Handle) error {
+ 	logctx.Info(ctx, "begin", zap.String("method", "Commit"), zap.Stringer("oid", txh.OID))
+ 	defer logctx.Info(ctx, "done", zap.String("method", "Commit"), zap.Stringer("oid", txh.OID))
+-	tx, err := sys.resolveTx(txh, true, 0)
++	tx, release, err := sys.resolveTx(txh, true, 0)
+ 	if err != nil {
+ 		return err
+ 	}
++	release()
+ 	if p := tx.backend.Params(); !p.Modify {
+ 		return blobcache.ErrTxReadOnly{Tx: txh.OID, Op: "COMMIT"}
+ 	}
+-	if err := tx.backend.Commit(ctx); err != nil {
++	if err := tx.commit(ctx); err != nil {
+ 		return setErrTxOID(err, txh.OID)
+ 	}
+-	sys.mu.Lock()
+-	sys.handles.Drop(txh)
+-	sys.mu.Unlock()
++	sys.finishAfterTerminal(txh)
+ 	sys.hub.Publish(ctx, tx.volume.info.ID, tx.volume)
+ 	return nil
+ }
+@@ -53,36 +155,37 @@ func (sys *System) Commit(ctx context.Context, txh blobcache.Handle) error {
+ func (sys *System) Abort(ctx context.Context, txh blobcache.Handle) error {
+ 	logctx.Info(ctx, "begin", zap.String("method", "Abort"), zap.Stringer("oid", txh.OID))
+ 	defer logctx.Info(ctx, "done", zap.String("method", "Abort"), zap.Stringer("oid", txh.OID))
+-	txn, err := sys.resolveTx(txh, false, 0)
++	txn, release, err := sys.resolveTx(txh, false, 0)
+ 	if err != nil {
+ 		return err
+ 	}
+-	if err := txn.backend.Abort(ctx); err != nil {
+-		return err
++	release()
++	if err := txn.abort(ctx); err != nil {
++		return setErrTxOID(err, txh.OID)
+ 	}
+-	sys.mu.Lock()
+-	defer sys.mu.Unlock()
+-	sys.handles.Drop(txh)
++	sys.finishAfterTerminal(txh)
+ 	return nil
+ }
+ 
+ func (sys *System) Load(ctx context.Context, txh blobcache.Handle, dst *[]byte) error {
+ 	logctx.Debug(ctx, "begin", zap.String("method", "Load"), zap.Stringer("oid", txh.OID))
+ 	defer logctx.Debug(ctx, "done", zap.String("method", "Load"), zap.Stringer("oid", txh.OID))
+-	txn, err := sys.resolveTx(txh, true, blobcache.Action_TX_LOAD)
++	txn, release, err := sys.resolveTx(txh, true, blobcache.Action_TX_LOAD)
+ 	if err != nil {
+ 		return err
+ 	}
++	defer release()
+ 	return setErrTxOID(txn.backend.Load(ctx, dst), txh.OID)
+ }
+ 
+ func (sys *System) Save(ctx context.Context, txh blobcache.Handle, root []byte) error {
+ 	logctx.Debug(ctx, "begin", zap.String("method", "Save"), zap.Stringer("oid", txh.OID))
+ 	defer logctx.Debug(ctx, "done", zap.String("method", "Save"), zap.Stringer("oid", txh.OID))
+-	tx, err := sys.resolveTx(txh, true, blobcache.Action_TX_SAVE)
++	tx, release, err := sys.resolveTx(txh, true, blobcache.Action_TX_SAVE)
+ 	if err != nil {
+ 		return err
+ 	}
++	defer release()
+ 	if p := tx.backend.Params(); !p.Modify {
+ 		return blobcache.ErrTxReadOnly{Tx: txh.OID, Op: "SAVE"}
+ 	}
+@@ -97,10 +200,11 @@ func (sys *System) Save(ctx context.Context, txh blobcache.Handle, root []byte)
+ func (sys *System) Post(ctx context.Context, txh blobcache.Handle, data []byte, opts blobcache.PostOpts) (blobcache.CID, error) {
+ 	logctx.Debug(ctx, "begin", zap.String("method", "Post"), zap.Stringer("oid", txh.OID))
+ 	defer logctx.Debug(ctx, "done", zap.String("method", "Post"), zap.Stringer("oid", txh.OID))
+-	txn, err := sys.resolveTx(txh, true, blobcache.Action_TX_POST)
++	txn, release, err := sys.resolveTx(txh, true, blobcache.Action_TX_POST)
+ 	if err != nil {
+ 		return blobcache.CID{}, err
+ 	}
++	defer release()
+ 	if p := txn.backend.Params(); !p.Modify {
+ 		return blobcache.CID{}, blobcache.ErrTxReadOnly{Tx: txh.OID, Op: "POST"}
+ 	}
+@@ -114,20 +218,22 @@ func (sys *System) Post(ctx context.Context, txh blobcache.Handle, data []byte,
+ func (sys *System) Exists(ctx context.Context, txh blobcache.Handle, cids []blobcache.CID, dst *blobcache.BitMap) error {
+ 	logctx.Debug(ctx, "begin", zap.String("method", "Exists"), zap.Stringer("oid", txh.OID))
+ 	defer logctx.Debug(ctx, "done", zap.String("method", "Exists"), zap.Stringer("oid", txh.OID))
+-	txn, err := sys.resolveTx(txh, true, blobcache.Action_TX_EXISTS)
++	txn, release, err := sys.resolveTx(txh, true, blobcache.Action_TX_EXISTS)
+ 	if err != nil {
+ 		return err
+ 	}
++	defer release()
+ 	return setErrTxOID(txn.backend.Exists(ctx, cids, dst), txh.OID)
+ }
+ 
+ func (sys *System) Get(ctx context.Context, txh blobcache.Handle, cid blobcache.CID, buf []byte, opts blobcache.GetOpts) (int, error) {
+ 	logctx.Debug(ctx, "begin", zap.String("method", "Get"), zap.Stringer("oid", txh.OID))
+ 	defer logctx.Debug(ctx, "done", zap.String("method", "Get"), zap.Stringer("oid", txh.OID))
+-	txn, err := sys.resolveTx(txh, true, blobcache.Action_TX_GET)
++	txn, release, err := sys.resolveTx(txh, true, blobcache.Action_TX_GET)
+ 	if err != nil {
+ 		return 0, err
+ 	}
++	defer release()
+ 	n, err := txn.backend.Get(ctx, cid, buf, opts)
+ 	if err != nil {
+ 		return 0, setErrTxOID(err, txh.OID)
+@@ -149,10 +255,11 @@ func (sys *System) Get(ctx context.Context, txh blobcache.Handle, cid blobcache.
+ func (sys *System) Delete(ctx context.Context, txh blobcache.Handle, cids []blobcache.CID) error {
+ 	logctx.Debug(ctx, "begin", zap.String("method", "Delete"), zap.Stringer("oid", txh.OID))
+ 	defer logctx.Debug(ctx, "done", zap.String("method", "Delete"), zap.Stringer("oid", txh.OID))
+-	txn, err := sys.resolveTx(txh, true, blobcache.Action_TX_DELETE)
++	txn, release, err := sys.resolveTx(txh, true, blobcache.Action_TX_DELETE)
+ 	if err != nil {
+ 		return err
+ 	}
++	defer release()
+ 	if p := txn.backend.Params(); !p.Modify {
+ 		return blobcache.ErrTxReadOnly{Tx: txh.OID, Op: "DELETE"}
+ 	}
+@@ -162,25 +269,29 @@ func (sys *System) Delete(ctx context.Context, txh blobcache.Handle, cids []blob
+ func (sys *System) Copy(ctx context.Context, txh blobcache.Handle, srcTxns []blobcache.Handle, cids []blobcache.CID, out *blobcache.BitMap) error {
+ 	logctx.Debug(ctx, "begin", zap.String("method", "Copy"), zap.Stringer("oid", txh.OID))
+ 	defer logctx.Debug(ctx, "done", zap.String("method", "Copy"), zap.Stringer("oid", txh.OID))
+-	dstTx, err := sys.resolveTx(txh, true, blobcache.Action_TX_COPY_TO)
++	dstTx, release, err := sys.resolveTx(txh, true, blobcache.Action_TX_COPY_TO)
+ 	if err != nil {
+ 		return err
+ 	}
++	defer release()
+ 	if p := dstTx.backend.Params(); !p.Modify {
+ 		return blobcache.ErrTxReadOnly{Tx: txh.OID, Op: "COPY"}
+ 	}
+ 
+ 	type srcTxn struct {
+ 		oid blobcache.OID
+-		tx  transaction
++		tx  *transaction
+ 	}
+ 	resolvedSrcs := make([]srcTxn, len(srcTxns))
+ 	for i, srcH := range srcTxns {
+-		src, err := sys.resolveTx(srcH, true, blobcache.Action_TX_COPY_FROM)
++		src, srcRelease, err := sys.resolveTx(srcH, true, blobcache.Action_TX_COPY_FROM)
+ 		if err != nil {
+ 			return err
+ 		}
+ 		resolvedSrcs[i] = srcTxn{oid: srcH.OID, tx: src}
++		// The source transactions stay entered for the duration of the Copy:
++		// the reaper waits for this operation to exit before aborting them.
++		defer srcRelease()
+ 	}
+ 
+ 	var buf []byte
+@@ -235,30 +346,33 @@ func (sys *System) Copy(ctx context.Context, txh blobcache.Handle, srcTxns []blo
+ func (sys *System) Visit(ctx context.Context, txh blobcache.Handle, cids []blobcache.CID) error {
+ 	logctx.Debug(ctx, "begin", zap.String("method", "Visit"), zap.Stringer("oid", txh.OID))
+ 	defer logctx.Debug(ctx, "done", zap.String("method", "Visit"), zap.Stringer("oid", txh.OID))
+-	txn, err := sys.resolveTx(txh, true, blobcache.Action_TX_VISIT)
++	txn, release, err := sys.resolveTx(txh, true, blobcache.Action_TX_VISIT)
+ 	if err != nil {
+ 		return err
+ 	}
++	defer release()
+ 	return setErrTxOID(txn.backend.Visit(ctx, cids), txh.OID)
+ }
+ 
+ func (sys *System) IsVisited(ctx context.Context, txh blobcache.Handle, cids []blobcache.CID, dst *blobcache.BitMap) error {
+ 	logctx.Debug(ctx, "begin", zap.String("method", "IsVisited"), zap.Stringer("oid", txh.OID))
+ 	defer logctx.Debug(ctx, "done", zap.String("method", "IsVisited"), zap.Stringer("oid", txh.OID))
+-	txn, err := sys.resolveTx(txh, true, blobcache.Action_TX_IS_VISITED)
++	txn, release, err := sys.resolveTx(txh, true, blobcache.Action_TX_IS_VISITED)
+ 	if err != nil {
+ 		return err
+ 	}
++	defer release()
+ 	return setErrTxOID(txn.backend.IsVisited(ctx, cids, dst), txh.OID)
+ }
+ 
+ func (sys *System) Link(ctx context.Context, txh blobcache.Handle, target blobcache.Handle, mask blobcache.ActionSet) (*blobcache.LinkToken, error) {
+ 	logctx.Debug(ctx, "begin", zap.String("method", "Link"), zap.Stringer("oid", txh.OID))
+ 	defer logctx.Debug(ctx, "done", zap.String("method", "Link"), zap.Stringer("oid", txh.OID))
+-	txn, err := sys.resolveTx(txh, true, blobcache.Action_TX_LINK_FROM)
++	txn, release, err := sys.resolveTx(txh, true, blobcache.Action_TX_LINK_FROM)
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	defer release()
+ 	volTo, rights, err := sys.resolveVol(target)
+ 	if err != nil {
+ 		return nil, err
+@@ -277,32 +391,47 @@ func (sys *System) Link(ctx context.Context, txh blobcache.Handle, target blobca
+ func (sys *System) Unlink(ctx context.Context, txh blobcache.Handle, targets []blobcache.LinkID) error {
+ 	logctx.Debug(ctx, "begin", zap.String("method", "Unlink"), zap.Stringer("oid", txh.OID))
+ 	defer logctx.Debug(ctx, "done", zap.String("method", "Unlink"), zap.Stringer("oid", txh.OID))
+-	txn, err := sys.resolveTx(txh, true, blobcache.Action_TX_UNLINK_FROM)
++	txn, release, err := sys.resolveTx(txh, true, blobcache.Action_TX_UNLINK_FROM)
+ 	if err != nil {
+ 		return err
+ 	}
++	defer release()
+ 	return setErrTxOID(txn.backend.Unlink(ctx, targets), txh.OID)
+ }
+ 
+ func (sys *System) VisitLinks(ctx context.Context, txh blobcache.Handle, targets []blobcache.LinkID) error {
+ 	logctx.Debug(ctx, "begin", zap.String("method", "VisitLinks"), zap.Stringer("oid", txh.OID))
+ 	defer logctx.Debug(ctx, "done", zap.String("method", "VisitLinks"), zap.Stringer("oid", txh.OID))
+-	txn, err := sys.resolveTx(txh, true, blobcache.Action_TX_VISIT_LINKS)
++	txn, release, err := sys.resolveTx(txh, true, blobcache.Action_TX_VISIT_LINKS)
+ 	if err != nil {
+ 		return err
+ 	}
++	defer release()
+ 	return setErrTxOID(txn.backend.VisitLinks(ctx, targets), txh.OID)
+ }
+ 
++// AbortAll terminates all transactions through the same convergent
++// termination flow used by Drop and Cleanup. Handles are dropped first,
++// in-flight operations are drained, and each backend is aborted.
++// A failing Abort is logged and retained for a later Cleanup retry, but it
++// does not prevent the other transactions from being terminated; shutdown
++// itself is best effort and always returns nil.
+ func (s *System) AbortAll(ctx context.Context) error {
+ 	s.mu.Lock()
+-	defer s.mu.Unlock()
++	txns := make(map[blobcache.OID]*transaction, len(s.txns))
+ 	for oid, txn := range s.txns {
+-		if err := txn.backend.Abort(ctx); err != nil {
+-			logctx.Warn(ctx, "aborting transaction", zap.Error(err))
+-		}
++		txns[oid] = txn
+ 		s.handles.DropAllForOID(oid)
+-		delete(s.txns, oid)
++	}
++	s.mu.Unlock()
++
++	for oid, txn := range txns {
++		if err := txn.terminate(ctx); err != nil {
++			logctx.Warn(ctx, "aborting transaction during shutdown; it remains for a later cleanup",
++				zap.Stringer("tx", oid), zap.Error(err))
++			continue
++		}
++		s.removeTxIfOrphan(oid)
+ 	}
+ 	return nil
+ }
+diff --git a/src/bccore/txcleanup_test.go b/src/bccore/txcleanup_test.go
+new file mode 100644
+index 0000000..ded7c99
+--- /dev/null
++++ b/src/bccore/txcleanup_test.go
+@@ -0,0 +1,370 @@
++package bccore_test
++
++import (
++	"context"
++	"errors"
++	"sync"
++	"sync/atomic"
++	"testing"
++	"time"
++
++	"blobcache.io/blobcache/src/bccore"
++	"blobcache.io/blobcache/src/blobcache"
++	"blobcache.io/blobcache/src/internal/backend/memory"
++	"blobcache.io/blobcache/src/internal/testutil"
++	"github.com/stretchr/testify/require"
++)
++
++var errInjectedAbort = errors.New("injected abort failure")
++
++// faultTx wraps a Tx and optionally fails Abort a configurable number of
++// times. It can also block Get to exercise in-flight draining.
++type faultTx struct {
++	bccore.Tx
++	vol *faultVolume
++}
++
++func (t *faultTx) Abort(ctx context.Context) error {
++	if t.vol != nil {
++		if n := t.vol.abortFailures.Load(); n > 0 {
++			t.vol.abortFailures.Add(-1)
++			return errInjectedAbort
++		}
++		if t.vol.onAbort != nil {
++			t.vol.onAbort()
++		}
++	}
++	return t.Tx.Abort(ctx)
++}
++
++func (t *faultTx) Get(ctx context.Context, cid blobcache.CID, buf []byte, opts blobcache.GetOpts) (int, error) {
++	if t.vol != nil && t.vol.onGet != nil {
++		return t.vol.onGet(ctx, t.Tx, cid, buf, opts)
++	}
++	return t.Tx.Get(ctx, cid, buf, opts)
++}
++
++// faultVolume wraps a volume so that every transaction it begins is a
++// faultTx. All other Volume methods delegate to the inner volume.
++type faultVolume struct {
++	bccore.Volume
++	abortFailures atomic.Int32
++	onAbort       func()
++	onGet         func(ctx context.Context, inner bccore.Tx, cid blobcache.CID, buf []byte, opts blobcache.GetOpts) (int, error)
++}
++
++func (v *faultVolume) BeginTx(ctx context.Context, spec blobcache.TxParams) (bccore.Tx, error) {
++	inner, err := v.Volume.BeginTx(ctx, spec)
++	if err != nil {
++		return nil, err
++	}
++	return &faultTx{Tx: inner, vol: v}, nil
++}
++
++func newFaultSystem(t testing.TB, abortFailures int32) (*bccore.System, *faultVolume) {
++	t.Helper()
++	vol := &faultVolume{Volume: memory.NewVolume(1 << 20)}
++	vol.abortFailures.Store(abortFailures)
++	s := bccore.New(bccore.Params{Root: vol})
++	return &s, vol
++}
++
++func rootVolumeHandle(s *bccore.System) blobcache.Handle {
++	return s.Mint(blobcache.OID{}, blobcache.Action_ALL, time.Now(), time.Hour)
++}
++
++// beginMutTx starts a mutating transaction on the root volume. The begin
++// call uses a bounded context so that a leaked per-volume write lock turns
++// into a test failure instead of an infinite hang.
++func beginMutTx(t testing.TB, ctx context.Context, s *bccore.System) blobcache.Handle {
++	t.Helper()
++	beginCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
++	defer cancel()
++	txh, err := s.BeginTx(beginCtx, rootVolumeHandle(s), blobcache.TxParams{Modify: true})
++	require.NoError(t, err)
++	require.NotNil(t, txh)
++	return *txh
++}
++
++func loadRoot(t testing.TB, ctx context.Context, s *bccore.System, txh blobcache.Handle) []byte {
++	t.Helper()
++	var dst []byte
++	require.NoError(t, s.Load(ctx, txh, &dst))
++	if dst == nil {
++		return []byte{}
++	}
++	return dst
++}
++
++// TestTxDroppedHandleReleasesVolume verifies that dropping the last handle
++// to a mutating transaction runs the termination flow immediately, so that
++// a new transaction on the same volume can start and does not see the
++// dropped transaction's intermediate writes.
++func TestTxDroppedHandleReleasesVolume(t *testing.T) {
++	ctx := testutil.Context(t)
++	s, _ := newFaultSystem(t, 0)
++
++	txh := beginMutTx(t, ctx, s)
++	require.NoError(t, s.Save(ctx, txh, []byte("intermediate")))
++	require.NoError(t, s.Drop(ctx, txh))
++
++	next := beginMutTx(t, ctx, s)
++	require.Equal(t, []byte{}, loadRoot(t, ctx, s, next))
++	require.NoError(t, s.Abort(ctx, next))
++}
++
++// TestTxExpiryCleanup verifies that expired transaction handles are
++// terminated by Cleanup and the volume becomes writable again.
++func TestTxExpiryCleanup(t *testing.T) {
++	ctx := testutil.Context(t)
++	s, _ := newFaultSystem(t, 0)
++
++	txh := beginMutTx(t, ctx, s)
++	require.NoError(t, s.Save(ctx, txh, []byte("intermediate")))
++
++	require.NoError(t, s.Cleanup(ctx, time.Now().Add(2*time.Minute), nil))
++
++	next := beginMutTx(t, ctx, s)
++	require.Equal(t, []byte{}, loadRoot(t, ctx, s, next))
++	require.NoError(t, s.Abort(ctx, next))
++}
++
++// TestTxCleanupReadOnly ensures read-only transactions are ended through
++// their backend lifecycle as well (they hold a read lock / snapshot), and
++// do not block a subsequent mutating transaction.
++func TestTxCleanupReadOnly(t *testing.T) {
++	ctx := testutil.Context(t)
++	s, _ := newFaultSystem(t, 0)
++
++	roh, err := s.BeginTx(ctx, rootVolumeHandle(s), blobcache.TxParams{Modify: false})
++	require.NoError(t, err)
++	var dst []byte
++	require.NoError(t, s.Load(ctx, *roh, &dst))
++	require.NoError(t, s.Cleanup(ctx, time.Now().Add(2*time.Minute), nil))
++
++	next := beginMutTx(t, ctx, s)
++	require.NoError(t, s.Abort(ctx, next))
++}
++
++// TestCommittedTxNotRolledBackByCleanup ensures a successfully committed
++// transaction is left committed even if Cleanup runs immediately after it.
++func TestCommittedTxNotRolledBackByCleanup(t *testing.T) {
++	ctx := testutil.Context(t)
++	s, _ := newFaultSystem(t, 0)
++
++	txh := beginMutTx(t, ctx, s)
++	require.NoError(t, s.Save(ctx, txh, []byte("committed")))
++	require.NoError(t, s.Commit(ctx, txh))
++	require.NoError(t, s.Cleanup(ctx, time.Now().Add(2*time.Minute), nil))
++
++	next := beginMutTx(t, ctx, s)
++	require.Equal(t, []byte("committed"), loadRoot(t, ctx, s, next))
++	require.NoError(t, s.Abort(ctx, next))
++}
++
++// TestKeepAlivePreventsExpiry verifies that KeepAlive extends an unexpired
++// transaction, and fails once the handle has been reaped, so reclamation
++// cannot be undone by a late KeepAlive.
++func TestKeepAlivePreventsExpiry(t *testing.T) {
++	ctx := testutil.Context(t)
++	s, _ := newFaultSystem(t, 0)
++
++	txh := beginMutTx(t, ctx, s)
++	require.NoError(t, s.Save(ctx, txh, []byte("kept alive")))
++
++	require.NoError(t, s.KeepAlive(ctx, []blobcache.Handle{txh}))
++	// The handle was just extended; an earlier cleanup must not reap it.
++	require.NoError(t, s.Cleanup(ctx, time.Now().Add(30*time.Second), nil))
++	require.Equal(t, []byte("kept alive"), loadRoot(t, ctx, s, txh))
++
++	// A later cleanup expires and terminates the transaction.
++	require.NoError(t, s.Cleanup(ctx, time.Now().Add(2*time.Minute), nil))
++	require.True(t, blobcache.IsErrInvalidHandle(s.KeepAlive(ctx, []blobcache.Handle{txh})),
++		"keepalive on a reaped handle must fail")
++
++	// The volume is immediately writable and cannot see the old writes.
++	next := beginMutTx(t, ctx, s)
++	require.Equal(t, []byte{}, loadRoot(t, ctx, s, next))
++	require.NoError(t, s.Abort(ctx, next))
++}
++
++// TestAbortFailureRetainedAndRetried verifies that a failed backend Abort
++// keeps the transaction around for a later Cleanup retry, while other
++// orphan transactions can still be cleaned up independently.
++func TestAbortFailureRetainedAndRetried(t *testing.T) {
++	ctx := testutil.Context(t)
++	s, root := newFaultSystem(t, 2)
++
++	// A second, healthy volume is mounted so that cleanup can be shown to
++	// progress independently of the failing root transaction.
++	otherVol := memory.NewVolume(1 << 20)
++	otherOID := blobcache.RandomOID()
++	otherHandle, err := s.Create(ctx, otherOID, otherVol, blobcache.Action_ALL, time.Now(), time.Hour)
++	require.NoError(t, err)
++
++	rootTx := beginMutTx(t, ctx, s)
++	require.NoError(t, s.Save(ctx, rootTx, []byte("root data")))
++	otherTx, err := s.BeginTx(ctx, otherHandle, blobcache.TxParams{Modify: true})
++	require.NoError(t, err)
++
++	// Drop both: root Abort fails (1st failure), other Abort succeeds.
++	require.NoError(t, s.Drop(ctx, rootTx))
++	require.NoError(t, s.Drop(ctx, *otherTx))
++
++	// The healthy volume must be writable right away.
++	beginCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
++	otherNext, err := s.BeginTx(beginCtx, otherHandle, blobcache.TxParams{Modify: true})
++	cancel()
++	require.NoError(t, err)
++	require.NoError(t, s.Abort(ctx, *otherNext))
++
++	// Root still locked by the unresolved transaction.
++	require.NoError(t, s.Cleanup(ctx, time.Now(), nil)) // 2nd failure, retained
++	// After the backend recovers, the next cleanup converges.
++	require.NoError(t, s.Cleanup(ctx, time.Now(), nil))
++
++	// Now the root volume is writable and the old writes are gone.
++	rootNext := beginMutTx(t, ctx, s)
++	require.Equal(t, []byte{}, loadRoot(t, ctx, s, rootNext))
++	require.NoError(t, s.Abort(ctx, rootNext))
++	require.Zero(t, root.abortFailures.Load(), "the failing Abort should have been retried to success")
++}
++
++// TestTerminationDrainsInFlightOperations verifies the termination order:
++// the backend Abort is only called after operations already inside the
++// transaction have exited.
++func TestTerminationDrainsInFlightOperations(t *testing.T) {
++	ctx := testutil.Context(t)
++	s, vol := newFaultSystem(t, 0)
++
++	entered := make(chan struct{})
++	releaseGet := make(chan struct{})
++	var aborted atomic.Bool
++	vol.onGet = func(ctx context.Context, inner bccore.Tx, cid blobcache.CID, buf []byte, opts blobcache.GetOpts) (int, error) {
++		close(entered)
++		select {
++		case <-releaseGet:
++		case <-ctx.Done():
++		}
++		return inner.Get(ctx, cid, buf, opts)
++	}
++	vol.onAbort = func() { aborted.Store(true) }
++
++	txh := beginMutTx(t, ctx, s)
++	getDone := make(chan struct{})
++	go func() {
++		_, _ = s.Get(ctx, txh, blobcache.CID{}, nil, blobcache.GetOpts{})
++		close(getDone)
++	}()
++	<-entered
++
++	dropDone := make(chan struct{})
++	go func() {
++		_ = s.Drop(ctx, txh)
++		close(dropDone)
++	}()
++
++	// While the Get is in flight, Abort must not have run and Drop must wait.
++	select {
++	case <-dropDone:
++		t.Fatal("Drop returned while an operation was still in flight")
++	case <-time.After(50 * time.Millisecond):
++	}
++	require.False(t, aborted.Load(), "backend aborted before in-flight operation exited")
++
++	close(releaseGet)
++	<-getDone
++	select {
++	case <-dropDone:
++	case <-time.After(3 * time.Second):
++		t.Fatal("Drop did not finish after the in-flight operation exited")
++	}
++	require.True(t, aborted.Load(), "backend Abort should run once operations drain")
++
++	// Volume reusable immediately.
++	next := beginMutTx(t, ctx, s)
++	require.NoError(t, s.Abort(ctx, next))
++}
++
++// TestCommitRacesDrop verifies that Commit and Drop/termination converge
++// to a single terminal state: the volume always ends either committed or
++// aborted, never stuck locked and never rolled back after commit.
++func TestCommitRacesDrop(t *testing.T) {
++	ctx := testutil.Context(t)
++	for i := 0; i < 30; i++ {
++		s, _ := newFaultSystem(t, 0)
++		txh := beginMutTx(t, ctx, s)
++		data := []byte("racing commit")
++		require.NoError(t, s.Save(ctx, txh, data))
++
++		var wg sync.WaitGroup
++		wg.Add(2)
++		var commitErr error
++		go func() {
++			defer wg.Done()
++			commitErr = s.Commit(ctx, txh)
++		}()
++		go func() {
++			defer wg.Done()
++			_ = s.Drop(ctx, txh)
++		}()
++		wg.Wait()
++		require.NoError(t, s.Cleanup(ctx, time.Now().Add(2*time.Minute), nil))
++		committed := commitErr == nil
++		if !committed {
++			// If Drop/cleanup won the race, the handle or transaction is
++			// already gone by the time Commit runs.
++			var doneErr blobcache.ErrTxDone
++			require.True(t, errors.As(commitErr, &doneErr) || blobcache.IsErrInvalidHandle(commitErr),
++				"unexpected commit result: %v", commitErr)
++		}
++
++		// The single-writer volume must be available regardless of outcome.
++		next := beginMutTx(t, ctx, s)
++		got := loadRoot(t, ctx, s, next)
++		if committed {
++			require.Equal(t, data, got, "committed data must survive")
++		} else {
++			require.Equal(t, []byte{}, got, "aborted transaction must leave no writes")
++		}
++		require.NoError(t, s.Abort(ctx, next))
++	}
++}
++
++// TestCommittedReplicaCleanup verifies that, when one handle replica is
++// dropped and another replica commits, cleanup never rolls the commit
++// back.
++func TestCommittedReplicaCleanup(t *testing.T) {
++	ctx := testutil.Context(t)
++	s, _ := newFaultSystem(t, 0)
++
++	h1 := beginMutTx(t, ctx, s)
++	h2, err := s.Share(h1, blobcache.Action_ALL)
++	if err != nil {
++		t.Skipf("transaction handle cannot be shared: %v", err)
++	}
++	require.NoError(t, s.Save(ctx, h1, []byte("replica commit")))
++
++	require.NoError(t, s.Drop(ctx, h1))
++	require.NoError(t, s.Commit(ctx, h2))
++	require.NoError(t, s.Cleanup(ctx, time.Now().Add(2*time.Minute), nil))
++
++	next := beginMutTx(t, ctx, s)
++	require.Equal(t, []byte("replica commit"), loadRoot(t, ctx, s, next))
++	require.NoError(t, s.Abort(ctx, next))
++}
++
++// TestAbortAllTerminatesTransactions verifies the Close path shares the
++// convergent termination flow and releases single-writer volumes.
++func TestAbortAllTerminatesTransactions(t *testing.T) {
++	ctx := testutil.Context(t)
++	s, _ := newFaultSystem(t, 0)
++
++	txh := beginMutTx(t, ctx, s)
++	require.NoError(t, s.Save(ctx, txh, []byte("shutdown")))
++	require.NoError(t, s.AbortAll(ctx))
++
++	next := beginMutTx(t, ctx, s)
++	require.Equal(t, []byte{}, loadRoot(t, ctx, s, next))
++	require.NoError(t, s.Abort(ctx, next))
++}
+diff --git a/src/bccore/volapi.go b/src/bccore/volapi.go
+index b186cea..5ef02b4 100644
+--- a/src/bccore/volapi.go
++++ b/src/bccore/volapi.go
+@@ -99,9 +99,9 @@ func (sys *System) BeginTx(ctx context.Context, volh blobcache.Handle, txspec bl
+ 	txoid := blobcache.RandomOID()
+ 	sys.mu.Lock()
+ 	if sys.txns == nil {
+-		sys.txns = make(map[blobcache.OID]transaction)
++		sys.txns = make(map[blobcache.OID]*transaction)
+ 	}
+-	sys.txns[txoid] = transaction{
++	sys.txns[txoid] = &transaction{
+ 		backend: tx,
+ 		volume:  &vol,
+ 	}
+diff --git a/src/bclocal/internal/localvol/abort_test.go b/src/bclocal/internal/localvol/abort_test.go
+new file mode 100644
+index 0000000..708ffe6
+--- /dev/null
++++ b/src/bclocal/internal/localvol/abort_test.go
+@@ -0,0 +1,204 @@
++package localvol
++
++import (
++	"context"
++	"encoding/binary"
++	"errors"
++	"os"
++	"path/filepath"
++	"testing"
++
++	"blobcache.io/blobcache/src/bclocal/internal/dbtab"
++	"blobcache.io/blobcache/src/bclocal/internal/pdb"
++	"blobcache.io/blobcache/src/blobcache"
++	"blobcache.io/blobcache/src/internal/schemareg"
++	"github.com/cockroachdb/pebble"
++	"github.com/stretchr/testify/require"
++)
++
++func mustRefCount(t testing.TB, db *pebble.DB, cid blobcache.CID) uint32 {
++	t.Helper()
++	k := pdb.TKey{TableID: dbtab.TID_BLOB_REF_COUNT, Key: cid[:16]}.Marshal(nil)
++	v, closer, err := db.Get(k)
++	if errors.Is(err, pebble.ErrNotFound) {
++		return 0
++	}
++	require.NoError(t, err)
++	defer closer.Close()
++	require.Len(t, v, 4)
++	return binary.BigEndian.Uint32(v)
++}
++
++func newTestLocalSystem(t testing.TB) (*System, *pebble.DB) {
++	t.Helper()
++	dir := t.TempDir()
++	db, err := pebble.Open(filepath.Join(dir, "pebble"), &pebble.Options{})
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = db.Close() })
++	require.NoError(t, os.MkdirAll(filepath.Join(dir, "blob"), 0o755))
++	blobDir, err := os.OpenRoot(filepath.Join(dir, "blob"))
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = blobDir.Close() })
++
++	txSys := pdb.NewTxSys(db, dbtab.TID_SYS_TXNS)
++	sys := New(Config{NoSync: true}, Env{
++		DB:       db,
++		BlobDir:  blobDir,
++		TxSys:    &txSys,
++		MkSchema: schemareg.Factory,
++	})
++	return &sys, db
++}
++
++func testVolume(t testing.TB, sys *System, id ID) *Volume {
++	return sys.UpNoErr(Params{
++		Key: id,
++		Params: blobcache.VolumeConfig{
++			HashAlgo: blobcache.HashAlgo_BLAKE3_256,
++			MaxSize:  1 << 20,
++		},
++	})
++}
++
++func countTableRows(t testing.TB, db *pebble.DB, tid pdb.TableID) int {
++	t.Helper()
++	sn := db.NewSnapshot()
++	defer sn.Close()
++	iter, err := sn.NewIter(&pebble.IterOptions{
++		LowerBound: pdb.TableLowerBound(tid),
++		UpperBound: pdb.TableUpperBound(tid),
++	})
++	require.NoError(t, err)
++	defer iter.Close()
++	n := 0
++	for iter.First(); iter.Valid(); iter.Next() {
++		n++
++	}
++	return n
++}
++
++func cellValue(t testing.TB, db *pebble.DB, volID ID, mvid pdb.MVTag) ([]byte, error) {
++	t.Helper()
++	k := pdb.MVKey{TableID: dbtab.TID_LOCAL_VOLUME_CELLS, Key: volID.Marshal(nil), Version: mvid}.Marshal(nil)
++	v, closer, err := db.Get(k)
++	if err != nil {
++		return nil, err
++	}
++	defer closer.Close()
++	return v, nil
++}
++
++// TestAbortMutReleasesEverything verifies that abortMut revokes the active
++// records, removes the transaction's MVCC rows and releases the per-volume
++// write lock so another mutating transaction can start immediately.
++func TestAbortMutReleasesEverything(t *testing.T) {
++	ctx := context.Background()
++	sys, db := newTestLocalSystem(t)
++	vol := testVolume(t, sys, 1)
++
++	txb, err := vol.BeginTx(ctx, blobcache.TxParams{Modify: true})
++	require.NoError(t, err)
++	tx := txb.(*localTxnMut)
++	require.NoError(t, tx.Save(ctx, []byte("cell data")))
++	cid, err := tx.Post(ctx, []byte("blob data"), blobcache.PostOpts{})
++	require.NoError(t, err)
++
++	require.NoError(t, sys.abortMut(1, tx.mvid))
++
++	// SYS_TXNS rows: only the sequence counter (key 0) may remain.
++	require.Equal(t, 1, countTableRows(t, db, dbtab.TID_SYS_TXNS))
++	require.Equal(t, 0, countTableRows(t, db, dbtab.TID_LOCAL_VOLUME_TXNS))
++	require.Equal(t, 0, countTableRows(t, db, dbtab.TID_LOCAL_VOLUME_CELLS))
++	require.Equal(t, 0, countTableRows(t, db, dbtab.TID_LOCAL_VOLUME_BLOBS))
++	require.Equal(t, uint32(0), mustRefCount(t, db, cid))
++
++	// The write lock is released: another mutating transaction starts and works.
++	txb2, err := vol.BeginTx(ctx, blobcache.TxParams{Modify: true})
++	require.NoError(t, err)
++	tx2 := txb2.(*localTxnMut)
++	require.NoError(t, tx2.Save(ctx, []byte("second")))
++	require.NoError(t, tx2.Commit(ctx))
++
++	// abortMut is idempotent on a finished transaction and must not undo
++	// committed state.
++	require.NoError(t, sys.abortMut(1, tx.mvid))
++	v, err := cellValue(t, db, 1, tx2.mvid)
++	require.NoError(t, err)
++	require.Equal(t, []byte("second"), v)
++}
++
++// TestAbortMutRetryAfterPhaseOne simulates an abort whose first phase
++// committed (failed marker + record revocation durable, lock released) but
++// whose MVCC cleanup did not run. The retry must skip phase one (never
++// releasing the lock twice) and finish cleanup without disturbing a newer
++// transaction holding the per-volume lock.
++func TestAbortMutRetryAfterPhaseOne(t *testing.T) {
++	ctx := context.Background()
++	sys, db := newTestLocalSystem(t)
++	vol := testVolume(t, sys, 1)
++
++	txb, err := vol.BeginTx(ctx, blobcache.TxParams{Modify: true})
++	require.NoError(t, err)
++	tx1 := txb.(*localTxnMut)
++	require.NoError(t, tx1.Save(ctx, []byte("old cell")))
++	cid, err := tx1.Post(ctx, []byte("old blob"), blobcache.PostOpts{})
++	require.NoError(t, err)
++
++	// Simulate a crash after phase 1: failed marker and record revocation
++	// are durable, and the write lock has been released.
++	ba := db.NewIndexedBatch()
++	require.NoError(t, deleteLocalVolumeTxn(ba, 1, tx1.mvid))
++	require.NoError(t, sys.txSys.Failure(ba, tx1.mvid))
++	require.NoError(t, ba.Commit(nil))
++	require.NoError(t, ba.Close())
++	sys.mutVol.Unlock(1)
++
++	// A newer transaction acquires the lock and commits.
++	txb2, err := vol.BeginTx(ctx, blobcache.TxParams{Modify: true})
++	require.NoError(t, err)
++	tx2 := txb2.(*localTxnMut)
++	require.NoError(t, tx2.Save(ctx, []byte("new cell")))
++	require.NoError(t, tx2.Commit(ctx))
++
++	// Retry the old abort. It must not touch tx2's lock or rows.
++	require.NoError(t, sys.abortMut(1, tx1.mvid))
++	require.Equal(t, 0, countTableRows(t, db, dbtab.TID_LOCAL_VOLUME_TXNS))
++	require.Equal(t, uint32(0), mustRefCount(t, db, cid))
++	v, err := cellValue(t, db, 1, tx2.mvid)
++	require.NoError(t, err)
++	require.Equal(t, []byte("new cell"), v)
++
++	// Another transaction can still begin, proving the lock was not stolen.
++	txb3, err := vol.BeginTx(ctx, blobcache.TxParams{Modify: true})
++	require.NoError(t, err)
++	var dst []byte
++	require.NoError(t, txb3.Load(ctx, &dst))
++	require.Equal(t, []byte("new cell"), dst)
++	require.NoError(t, txb3.Abort(ctx))
++}
++
++// TestAbortCommittedIsANoOp verifies that aborting a transaction which
++// already committed neither undoes committed rows nor unlocks another
++// transaction's write lock.
++func TestAbortCommittedIsANoOp(t *testing.T) {
++	ctx := context.Background()
++	sys, db := newTestLocalSystem(t)
++	vol := testVolume(t, sys, 1)
++
++	txb, err := vol.BeginTx(ctx, blobcache.TxParams{Modify: true})
++	require.NoError(t, err)
++	tx := txb.(*localTxnMut)
++	require.NoError(t, tx.Save(ctx, []byte("committed cell")))
++	require.NoError(t, tx.Commit(ctx))
++
++	// abort after commit must find no active row and do nothing.
++	require.NoError(t, sys.abortMut(1, tx.mvid))
++	v, err := cellValue(t, db, 1, tx.mvid)
++	require.NoError(t, err)
++	require.Equal(t, []byte("committed cell"), v)
++
++	// Volume lock is held by nobody: new transaction begins immediately.
++	txb2, err := vol.BeginTx(ctx, blobcache.TxParams{Modify: true})
++	require.NoError(t, err)
++	require.NoError(t, txb2.Abort(ctx))
++}
+diff --git a/src/bclocal/internal/localvol/system.go b/src/bclocal/internal/localvol/system.go
+index 9bbc9a0..1fe2aaa 100644
+--- a/src/bclocal/internal/localvol/system.go
++++ b/src/bclocal/internal/localvol/system.go
+@@ -202,6 +202,11 @@ func (ls *System) beginTx(ctx context.Context, vol *Volume, params blobcache.TxP
+ 	// we don't use doRW here because, nothing we do accesses MVCC tables.
+ 	ba := ls.db.NewIndexedBatch()
+ 	defer ba.Close()
++	// mark the transaction as active in SYS_TXNS: MVCC reads exclude active
++	// versions, and abort/commit transition the row to failed/removed.
++	if err := ls.txSys.Start(ba, txid); err != nil {
++		return nil, err
++	}
+ 	if err := putLocalVolumeTxn(ba, vol.lvid, txid); err != nil {
+ 		return nil, err
+ 	}
+@@ -217,41 +222,124 @@ func (ls *System) beginTx(ctx context.Context, vol *Volume, params blobcache.TxP
+ }
+ 
+ // abortMut aborts a mutating transaction.
++//
++// The flow has two independently retryable phases, distinguished by the
++// transaction's row in SYS_TXNS:
++//
++// Phase 1, while the per-volume write lock is held: revoke the volume's
++// active transaction record and mark the transaction as failed. The write
++// lock is released only after this phase has been committed.
++//
++// Phase 2, without the write lock: remove every MVCC row written by the
++// transaction (undoing blob references and cell writes) and finally remove
++// the failed row from the active set.
++//
++// If a storage error interrupts phase 2, a later invocation observes the
++// failed marker, skips phase 1 (so the write lock is never released
++// twice) and retries phase 2. A committed or already removed transaction
++// is left completely untouched.
+ func (s *System) abortMut(volID ID, mvid pdb.MVTag) error {
+-	if err := func() error {
++	// A missing row means the transaction committed, was already fully
++	// removed, or never existed: its MVCC rows are committed state and must
++	// not be undone, and the write lock must not be touched.
++	active, failed, err := s.txSys.GetState(s.db, mvid)
++	if err != nil {
++		return err
++	}
++	if !active {
++		return nil
++	}
++
++	// Phase 1, while the per-volume write lock is held: revoke the volume's
++	// active transaction record and mark the transaction as failed. If a
++	// previous attempt already completed this phase (failed marker present),
++	// skip it so that the lock is never released twice.
++	needUnlock := false
++	if !failed {
+ 		ba := s.db.NewIndexedBatch()
+-		defer ba.Close()
+-		yesActive, err := s.txSys.IsActive(ba, mvid)
+-		if err != nil {
++		if err := deleteLocalVolumeTxn(ba, volID, mvid); err != nil {
++			_ = ba.Close()
+ 			return err
+ 		}
+-		if !yesActive {
+-			return nil
+-		}
+ 		if err := s.txSys.Failure(ba, mvid); err != nil {
++			_ = ba.Close()
+ 			return err
+ 		}
+-		return ba.Commit(nil)
+-	}(); err != nil {
++		if err := ba.Commit(nil); err != nil {
++			_ = ba.Close()
++			return err
++		}
++		if err := ba.Close(); err != nil {
++			return err
++		}
++		needUnlock = true
++	}
++	if needUnlock {
++		s.mutVol.Unlock(volID)
++	}
++
++	// Phase 2, without the write lock: remove every MVCC row written by the
++	// transaction (undoing blob references and cell writes) and finally remove
++	// the failed row from the active set. An indexed batch is required because
++	// the blob reference count updates read their previous value first.
++	ba := s.db.NewIndexedBatch()
++	defer ba.Close()
++	if err := undoVolumeBlobs(s.db, ba, volID, mvid); err != nil {
+ 		return err
+ 	}
+-	s.mutVol.Unlock(volID)
++	if err := pdb.Undo(s.db, ba, dbtab.TID_LOCAL_VOLUME_CELLS, volID.Marshal(nil), mvid); err != nil {
++		return err
++	}
++	if err := s.txSys.RemoveFailed(ba, mvid); err != nil {
++		return err
++	}
++	return ba.Commit(nil)
++}
+ 
+-	if err := func() error {
+-		ba := s.db.NewBatch()
+-		defer ba.Close()
+-		if err := pdb.Undo(s.db, ba, dbtab.TID_LOCAL_VOLUME_BLOBS, volID.Marshal(nil), mvid); err != nil {
++// undoVolumeBlobs removes all LOCAL_VOLUME_BLOBS rows written by mvid and
++// reverses their effect on the blob reference counts. Each surviving
++// non-tombstone row incremented the reference count when it was created, so
++// removing it decrements the count again. Rows which ended as tombstones
++// already released their count in tombVolumeBlob when they overwrote a
++// non-tombstone row from the same transaction.
++func undoVolumeBlobs(snp pdb.RO, ba *pebble.Batch, volID ID, mvid pdb.MVTag) error {
++	prefix := volID.Marshal(nil)
++	iter, err := snp.NewIter(&pebble.IterOptions{
++		LowerBound: pdb.TKey{TableID: dbtab.TID_LOCAL_VOLUME_BLOBS, Key: append([]byte(nil), prefix...)}.Marshal(nil),
++		UpperBound: pdb.TKey{TableID: dbtab.TID_LOCAL_VOLUME_BLOBS, Key: pdb.PrefixUpperBound(append([]byte(nil), prefix...))}.Marshal(nil),
++		SkipPoint: func(k []byte) bool {
++			mvk, err := pdb.ParseMVKey(k)
++			if err != nil {
++				return true
++			}
++			return mvk.Version != mvid
++		},
++	})
++	if err != nil {
++		return err
++	}
++	defer iter.Close()
++	for iter.First(); iter.Valid(); iter.Next() {
++		k, err := pdb.ParseTKey(iter.Key())
++		if err != nil {
+ 			return err
+ 		}
+-		if err := pdb.Undo(s.db, ba, dbtab.TID_LOCAL_VOLUME_CELLS, volID.Marshal(nil), mvid); err != nil {
++		v := iter.Value()
++		if err := ba.Delete(k.Marshal(nil), nil); err != nil {
+ 			return err
+ 		}
+-		if err := s.txSys.RemoveFailed(ba, mvid); err != nil {
+-			return err
++		if len(v) > 0 {
++			// volume blob keys are the volume ID followed by the 16 byte
++			// CID prefix; reference counts are keyed on the same prefix.
++			if len(k.Key) < 8+16 {
++				return fmt.Errorf("invalid volume blob key length: %d", len(k.Key))
++			}
++			var cid blobcache.CID
++			copy(cid[:16], k.Key[8:8+16])
++			if _, err := blobRefCountIncr(ba, cid, -1); err != nil {
++				return err
++			}
+ 		}
+-		return ba.Commit(nil)
+-	}(); err != nil {
+-		return err
+ 	}
+ 	return nil
+ }
+@@ -266,6 +354,11 @@ func (s *System) commit(volID ID, mvid pdb.MVTag, links backend.LinkSet) error {
+ 	if err := s.putVolumeLinks(ba, mvid, volID, links); err != nil {
+ 		return err
+ 	}
++	// revoke the volume's active transaction record before publishing the
++	// new version, while the per-volume write lock is still held.
++	if err := deleteLocalVolumeTxn(ba, volID, mvid); err != nil {
++		return err
++	}
+ 	if !s.cfg.NoSync {
+ 		if err := s.blobs.Flush(); err != nil {
+ 			return err
+@@ -490,8 +583,11 @@ func (s *System) load(volID ID, mvid pdb.MVTag, dst *[]byte) error {
+ // If any of them do not exist, the operation is a no-op.
+ func (s *System) visit(volID ID, mvid pdb.MVTag, cids []blobcache.CID) error {
+ 	return s.doRW(func(ba *pebble.Batch, excluding func(pdb.MVTag) bool) error {
++		// the current transaction must never exclude its own rows, even
++		// though its MVTag is present in the active set.
++		includingSelf := excludeExcluding(excluding, mvid)
+ 		for _, cid := range cids {
+-			exists, err := volumeBlobExists(ba, volID, cid, excluding)
++			exists, err := volumeBlobExists(ba, volID, cid, includingSelf)
+ 			if err != nil {
+ 				return err
+ 			}
+@@ -616,12 +712,29 @@ func setVolumeBlob(ba *pebble.Batch, volID ID, mvid pdb.MVTag, cid blobcache.CID
+ 
+ // unsetVolumeBlob writes an empty value to the LOCAL_VOLUME_BLOBS table.
+ // empty values are tombstones, which will eventually be cleaned up by the vacuum process.
++// If the same transaction previously wrote a non-tombstone row at this key,
++// the blob reference added with that row is released, so that aborting the
++// transaction does not leak a reference count.
+ func tombVolumeBlob(ba *pebble.Batch, volID ID, mvid pdb.MVTag, cidp [16]byte) error {
+ 	k := pdb.MVKey{
+ 		TableID: dbtab.TID_LOCAL_VOLUME_BLOBS,
+ 		Key:     slices.Concat(volID.Marshal(nil), cidp[:]),
+ 		Version: mvid,
+ 	}
++	v, closer, err := ba.Get(k.Marshal(nil))
++	if err != nil && !errors.Is(err, pebble.ErrNotFound) {
++		return err
++	}
++	if closer != nil {
++		defer closer.Close()
++	}
++	if err == nil && len(v) > 0 {
++		var cid blobcache.CID
++		copy(cid[:16], cidp[:])
++		if _, err := blobRefCountIncr(ba, cid, -1); err != nil {
++			return err
++		}
++	}
+ 	return ba.Set(k.Marshal(nil), nil, nil)
+ }
+ 
+diff --git a/src/bclocal/internal/localvol/vollinks.go b/src/bclocal/internal/localvol/vollinks.go
+index 7431837..1292ce9 100644
+--- a/src/bclocal/internal/localvol/vollinks.go
++++ b/src/bclocal/internal/localvol/vollinks.go
+@@ -69,11 +69,11 @@ func (ls *System) readVolumeLinks(sp pdb.RO, mvid pdb.MVTag, fromVolID ID, dst b
+ 		if x == mvid {
+ 			return false
+ 		} else {
+-			ok, err := ls.txSys.IsActive(sp, x)
++			active, _, err := ls.txSys.GetState(sp, x)
+ 			if err != nil {
+ 				return false
+ 			}
+-			return ok
++			return active
+ 		}
+ 	}
+ 	gteq := pdb.MVKey{
+diff --git a/src/bclocal/internal/pdb/pdb.go b/src/bclocal/internal/pdb/pdb.go
+index 6728bb6..14331ed 100644
+--- a/src/bclocal/internal/pdb/pdb.go
++++ b/src/bclocal/internal/pdb/pdb.go
+@@ -286,14 +286,20 @@ func Compact(sp *pebble.Snapshot, ba *pebble.Batch, tableID TableID, exclude fun
+ 
+ // Undo removes all the rows in a given table with a specific version.
+ func Undo(sp RO, ba WO, tid TableID, prefix []byte, mvid MVTag) error {
+-	var upperBound []byte
++	// PrefixUpperBound mutates the prefix slice in place, so work on copies
++	// and keep the lower bound independent of the upper bound computation.
++	lowerKey := append([]byte(nil), prefix...)
++	upperKey := PrefixUpperBound(append([]byte(nil), prefix...))
++	var lowerBound, upperBound []byte
+ 	if len(prefix) == 0 {
++		lowerBound = TableLowerBound(tid)
+ 		upperBound = TableUpperBound(tid)
+ 	} else {
+-		upperBound = TKey{TableID: tid, Key: PrefixUpperBound(prefix)}.Marshal(nil)
++		lowerBound = TKey{TableID: tid, Key: lowerKey}.Marshal(nil)
++		upperBound = TKey{TableID: tid, Key: upperKey}.Marshal(nil)
+ 	}
+ 	iter, err := sp.NewIter(&pebble.IterOptions{
+-		LowerBound: TKey{TableID: tid, Key: prefix}.Marshal(nil),
++		LowerBound: lowerBound,
+ 		UpperBound: upperBound,
+ 		SkipPoint: func(k []byte) bool {
+ 			mvk, err := ParseMVKey(k)
+@@ -307,7 +313,7 @@ func Undo(sp RO, ba WO, tid TableID, prefix []byte, mvid MVTag) error {
+ 		return err
+ 	}
+ 	defer iter.Close()
+-	for iter.Next() {
++	for iter.First(); iter.Valid(); iter.Next() {
+ 		k, err := ParseTKey(iter.Key())
+ 		if err != nil {
+ 			return err
+diff --git a/src/bclocal/internal/pdb/pdb_test.go b/src/bclocal/internal/pdb/pdb_test.go
+index cb39988..9a62d10 100644
+--- a/src/bclocal/internal/pdb/pdb_test.go
++++ b/src/bclocal/internal/pdb/pdb_test.go
+@@ -22,7 +22,7 @@ func TestTxSystem(t *testing.T) {
+ 
+ 	// mark the transaction as active
+ 	require.NoError(t, DoRW(db, func(ba *pebble.Batch) error {
+-		return txs.start(ba, txid1)
++		return txs.Start(ba, txid1)
+ 	}))
+ 	// read the active transactions
+ 	activeTxns := make(map[MVTag]struct{})
+diff --git a/src/bclocal/internal/pdb/txsys.go b/src/bclocal/internal/pdb/txsys.go
+index 6466478..59e4b6b 100644
+--- a/src/bclocal/internal/pdb/txsys.go
++++ b/src/bclocal/internal/pdb/txsys.go
+@@ -1,6 +1,7 @@
+ package pdb
+ 
+ import (
++	"bytes"
+ 	"encoding/binary"
+ 	"errors"
+ 	"fmt"
+@@ -41,8 +42,8 @@ func (txs *TxSys) AllocateTxID() (MVTag, error) {
+ 	return MVTag(txid), nil
+ }
+ 
+-// start marks a transaction as active.
+-func (txs *TxSys) start(ba WO, txid MVTag) error {
++// Start marks a transaction as active.
++func (txs *TxSys) Start(ba WO, txid MVTag) error {
+ 	k := TKey{
+ 		TableID: txs.table,
+ 		Key:     binary.BigEndian.AppendUint64(nil, uint64(txid)),
+@@ -55,10 +56,14 @@ func (txs *TxSys) Success(ba WO, txid MVTag) error {
+ 	return ba.Delete(txs.sysTxnKey(nil, txid), nil)
+ }
+ 
++// failedTxValue is the value written by Failure to mark a transaction
++// as aborted but not yet fully cleaned up.
++var failedTxValue = []byte{0x01}
++
+ // failure marks a transaction as failed.
+ // The transaction stays in the active set.
+ func (txs *TxSys) Failure(ba WO, txid MVTag) error {
+-	return ba.Set(txs.sysTxnKey(nil, txid), []byte{0x01}, nil)
++	return ba.Set(txs.sysTxnKey(nil, txid), failedTxValue, nil)
+ }
+ 
+ // removeFailed removes a failed transaction from the active set.
+@@ -71,16 +76,20 @@ func (txs *TxSys) ReadActive(sp RO, dst map[MVTag]struct{}) error {
+ 	return txs.readActive(sp, dst)
+ }
+ 
+-func (txs *TxSys) IsActive(sn RO, txid MVTag) (bool, error) {
+-	_, closer, err := sn.Get(txs.sysTxnKey(nil, txid))
++// GetState reports whether a transaction is present in the active set and,
++// when it is, whether it has already been marked failed by a previous
++// abort attempt. A missing row means the transaction either committed or
++// was never started.
++func (txs *TxSys) GetState(sn RO, txid MVTag) (active, failed bool, _ error) {
++	v, closer, err := sn.Get(txs.sysTxnKey(nil, txid))
+ 	if err != nil {
+ 		if errors.Is(err, pebble.ErrNotFound) {
+-			return false, nil
++			return false, false, nil
+ 		}
+-		return false, err
++		return false, false, err
+ 	}
+ 	defer closer.Close()
+-	return closer != nil, nil
++	return true, bytes.Equal(v, failedTxValue), nil
+ }
+ 
+ // readActiveSysTxns reads the active transactions
+diff --git a/src/bclocal/txcleanup_test.go b/src/bclocal/txcleanup_test.go
+new file mode 100644
+index 0000000..3c106c9
+--- /dev/null
++++ b/src/bclocal/txcleanup_test.go
+@@ -0,0 +1,188 @@
++package bclocal
++
++import (
++	"context"
++	"encoding/binary"
++	"testing"
++	"time"
++
++	"blobcache.io/blobcache/src/bclocal/internal/dbtab"
++	"blobcache.io/blobcache/src/bclocal/internal/localvol"
++	"blobcache.io/blobcache/src/bclocal/internal/pdb"
++	"blobcache.io/blobcache/src/blobcache"
++	"blobcache.io/blobcache/src/internal/testutil"
++	"github.com/cockroachdb/pebble"
++	"github.com/stretchr/testify/require"
++)
++
++func noneVolumeHandle(t testing.TB, svc *Service) (blobcache.Handle, localvol.ID) {
++	t.Helper()
++	ctx := testutil.Context(t)
++	spec := blobcache.VolumeSpec{
++		Local: &blobcache.VolumeBackend_Local{
++			HashAlgo: blobcache.HashAlgo_BLAKE3_256,
++			MaxSize:  1 << 20,
++		},
++	}
++	h, err := svc.CreateVolume(ctx, nil, spec)
++	require.NoError(t, err)
++	salt, err := getOIDSalt(svc.db)
++	require.NoError(t, err)
++	lvid, err := localvol.LocalIDFromOID(salt, h.OID)
++	require.NoError(t, err)
++	return *h, lvid
++}
++
++func beginMutTxBounded(t testing.TB, svc *Service, volh blobcache.Handle) blobcache.Handle {
++	t.Helper()
++	ctx, cancel := context.WithTimeout(testutil.Context(t), 5*time.Second)
++	defer cancel()
++	txh, err := svc.BeginTx(ctx, volh, blobcache.TxParams{Modify: true})
++	require.NoError(t, err)
++	return *txh
++}
++
++func localVolTxnKey(volID localvol.ID) []byte {
++	return pdb.TKey{
++		TableID: dbtab.TID_LOCAL_VOLUME_TXNS,
++		Key:     volID.Marshal(nil),
++	}.Marshal(nil)
++}
++
++func activeTxCount(t testing.TB, svc *Service) int {
++	t.Helper()
++	sn := svc.db.NewSnapshot()
++	defer sn.Close()
++	active := make(map[pdb.MVTag]struct{})
++	require.NoError(t, svc.txSys.ReadActive(sn, active))
++	return len(active)
++}
++
++func volumeTxnRecordExists(t testing.TB, svc *Service, volID localvol.ID) bool {
++	t.Helper()
++	sn := svc.db.NewSnapshot()
++	defer sn.Close()
++	_, closer, err := sn.Get(localVolTxnKey(volID))
++	if err != nil {
++		require.ErrorIs(t, err, pebble.ErrNotFound)
++		return false
++	}
++	closer.Close()
++	return true
++}
++
++func blobRefCount(t testing.TB, svc *Service, cid blobcache.CID) uint32 {
++	t.Helper()
++	k := pdb.TKey{TableID: dbtab.TID_BLOB_REF_COUNT, Key: cid[:16]}.Marshal(nil)
++	v, closer, err := svc.db.Get(k)
++	if err != nil {
++		require.ErrorIs(t, err, pebble.ErrNotFound)
++		return 0
++	}
++	defer closer.Close()
++	require.Len(t, v, 4)
++	return binary.BigEndian.Uint32(v)
++}
++
++// TestLocalTxCleanupOnDrop verifies the full local backend cleanup of a
++// mutating transaction whose last handle is dropped: the per-volume write
++// lock is released, the active transaction records are revoked, MVCC
++// writes become invisible and blob reference counts are undone.
++func TestLocalTxCleanupOnDrop(t *testing.T) {
++	ctx := testutil.Context(t)
++	svc := NewTestService(t)
++	volH, lvid := noneVolumeHandle(t, svc)
++
++	txh := beginMutTxBounded(t, svc, volH)
++	require.NoError(t, svc.Save(ctx, txh, []byte("intermediate")))
++	data := []byte("dropped transaction blob")
++	cid, err := svc.Post(ctx, txh, data, blobcache.PostOpts{})
++	require.NoError(t, err)
++	require.NoError(t, svc.Drop(ctx, txh))
++
++	// A new mutating transaction on the same volume starts immediately:
++	// the per-volume write lock was released by the termination flow.
++	next := beginMutTxBounded(t, svc, volH)
++	var root []byte
++	require.NoError(t, svc.Load(ctx, next, &root))
++	require.Empty(t, root, "aborted cell write must be invisible")
++	var exists blobcache.BitMap
++	require.NoError(t, svc.Exists(ctx, next, []blobcache.CID{cid}, &exists))
++	require.False(t, exists.IsSet(0), "aborted blob write must be invisible")
++	require.NoError(t, svc.Abort(ctx, next))
++
++	require.Zero(t, activeTxCount(t, svc), "SYS_TXNS active record must be revoked")
++	require.False(t, volumeTxnRecordExists(t, svc, lvid), "LOCAL_VOLUME_TXNS record must be revoked")
++	require.Zero(t, blobRefCount(t, svc, cid), "aborted blob reference must be released")
++}
++
++// TestLocalTxCleanupPostThenDelete verifies reference counts balance when
++// a transaction posts and then deletes the same blob before being dropped.
++func TestLocalTxCleanupPostThenDelete(t *testing.T) {
++	ctx := testutil.Context(t)
++	svc := NewTestService(t)
++	volH, _ := noneVolumeHandle(t, svc)
++
++	txh := beginMutTxBounded(t, svc, volH)
++	data := []byte("post then delete")
++	cid, err := svc.Post(ctx, txh, data, blobcache.PostOpts{})
++	require.NoError(t, err)
++	require.NoError(t, svc.Delete(ctx, txh, []blobcache.CID{cid}))
++	require.NoError(t, svc.Drop(ctx, txh))
++
++	// Volume writable again and the reference count leaked neither way.
++	next := beginMutTxBounded(t, svc, volH)
++	require.NoError(t, svc.Abort(ctx, next))
++	require.Zero(t, blobRefCount(t, svc, cid))
++}
++
++// TestLocalTxCleanupLeavesUnexpiredAlone verifies that periodic Cleanup
++// does not touch a transaction whose handle is still alive, and that the
++// transaction is then cleanly terminated by Drop.
++func TestLocalTxCleanupLeavesUnexpiredAlone(t *testing.T) {
++	ctx := testutil.Context(t)
++	svc := NewTestService(t)
++	volH, _ := noneVolumeHandle(t, svc)
++
++	txh := beginMutTxBounded(t, svc, volH)
++	require.NoError(t, svc.Save(ctx, txh, []byte("unexpired")))
++	require.NoError(t, svc.Cleanup(ctx))
++	var root []byte
++	require.NoError(t, svc.Load(ctx, txh, &root))
++	require.Equal(t, []byte("unexpired"), root)
++
++	// Dropping the last handle runs the same convergent termination flow.
++	require.NoError(t, svc.Drop(ctx, txh))
++	_, err := svc.InspectTx(ctx, txh)
++	require.Error(t, err)
++
++	next := beginMutTxBounded(t, svc, volH)
++	var nextRoot []byte
++	require.NoError(t, svc.Load(ctx, next, &nextRoot))
++	require.Empty(t, nextRoot)
++	require.NoError(t, svc.Abort(ctx, next))
++	require.Zero(t, activeTxCount(t, svc))
++}
++
++// TestLocalTxCommitRevokesRecords verifies that committing a mutating
++// transaction revokes the per-volume active record and remains durable
++// against later cleanup, with the write lock released.
++func TestLocalTxCommitRevokesRecords(t *testing.T) {
++	ctx := testutil.Context(t)
++	svc := NewTestService(t)
++	volH, lvid := noneVolumeHandle(t, svc)
++
++	txh := beginMutTxBounded(t, svc, volH)
++	require.NoError(t, svc.Save(ctx, txh, []byte("final")))
++	require.NoError(t, svc.Commit(ctx, txh))
++
++	require.False(t, volumeTxnRecordExists(t, svc, lvid))
++	require.Zero(t, activeTxCount(t, svc))
++
++	require.NoError(t, svc.Cleanup(ctx))
++	next := beginMutTxBounded(t, svc, volH)
++	var root []byte
++	require.NoError(t, svc.Load(ctx, next, &root))
++	require.Equal(t, []byte("final"), root)
++	require.NoError(t, svc.Abort(ctx, next))
++}

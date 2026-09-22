@@ -69,11 +69,11 @@ func (ls *System) readVolumeLinks(sp pdb.RO, mvid pdb.MVTag, fromVolID ID, dst b
 		if x == mvid {
 			return false
 		} else {
-			ok, err := ls.txSys.IsActive(sp, x)
+			active, _, err := ls.txSys.GetState(sp, x)
 			if err != nil {
 				return false
 			}
-			return ok
+			return active
 		}
 	}
 	gteq := pdb.MVKey{
