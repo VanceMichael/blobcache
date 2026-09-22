@@ -1,0 +1,1253 @@
+diff --git a/evidence/rubric-report.txt b/evidence/rubric-report.txt
+new file mode 100644
+index 0000000..e2998fa
+--- /dev/null
++++ b/evidence/rubric-report.txt
+@@ -0,0 +1,10 @@
++项目：092109/project-03｜题目：让 Unix IPC 取消后有界收敛｜固定版本：0d8f3f308c3eb04f9b5c450d5773a6be84b22523
++有效轮数：80｜Harness：Trae｜Session：6ab1030041e3bff58c9cf57e｜扫描来源：count-trae-cn-steps.py/latest_turn
++可复现验证：go test -count=1 ./src/bcipc ./src/bcp ./src/internal/pools ./src/internal/backend/memory 通过。
++Rubric ID：1｜状态：未通过｜期望行为：取消 Serve 的父 context 会关闭 listener 和全部已接收连接，包括对端池中的空闲连接，并等待相关处理 goroutine 在有界时间内结束。｜实际观察：取消 watcher 执行 closeAll 与 AcceptUnix 存在交错，AcceptUnix 已返回而 conns.add 尚未执行时，closeAll 不包含该连接；随后连接进入 ServeStream，父 context 已取消但新连接没有再次被 closeAll 关闭，Serve 的 wg.Wait 等待该连接读协程。｜直接证据：src/bcipc/server.go:47-65；src/bcp/serve.go:28-59。｜原因：listener 接受与 accepted connection 登记不是同一关闭准入边界。｜影响：关闭交错下 Serve 的返回依赖未关闭连接，无法保证有界返回。｜证据位置：src/bcipc/server.go:47-65。
++Rubric ID：2｜状态：通过｜期望行为：客户端请求在连接已取出后取消时能中断阻塞读写并返回相应 context 错误；服务端正在执行的阻塞 Dequeue 或其他处理器也随连接/服务生命周期取消。｜实际观察：Ask 的 watcher 在 ctx.Done 时关闭已取出连接并返回 ctx.Err，ServeStream 的 reader 发现 EOF 后取消 handler context，Dequeue 使用该 context 退出。｜直接证据：src/bcipc/bcipc.go:34-71；src/bcp/serve.go:28-75；src/bcipc/bcipc_test.go:196-218、441-496。
++Rubric ID：3｜状态：通过｜期望行为：取消、超时、畸形响应以及读写失败的连接会被关闭而非归还池中，随后一次正常调用使用健康连接并得到正确响应。｜实际观察：Ask 仅在完整读写后设置 healthy，错误路径 Give(false)；pool.Give 对 false 调用 closeFn，畸形帧由 ServeStream 返回错误并关闭连接。｜直接证据：src/bcipc/bcipc.go:50-74；src/internal/pools/pool.go:72-94；src/bcp/serve.go:67-91。
++Rubric ID：4｜状态：通过｜期望行为：Client.Close 与 Take、Give 和在途请求并发或重复执行时不会死锁、泄漏或让连接在关闭后重新进入池，所有受影响调用都确定结束。｜实际观察：pool.Close 设置 closed、清空 leased、关闭空闲和在用资源；Take/Give 在 closed 状态拒绝或关闭资源，Close 重复调用直接返回。｜直接证据：src/internal/pools/pool.go:37-69、72-134；src/bcipc/client.go:44-55。
++Rubric ID：5｜状态：通过｜期望行为：客户端断开或取消的阻塞请求不会在后台继续消费后续队列消息、提交事务状态或写出迟到响应，新的独立请求可正常工作。｜实际观察：ServeStream reader 监测对端断开并取消 handler context，memory Queue 在唤醒后先检查取消再消费消息；定向 bcipc 测试验证取消后后续 Dequeue 收到消息。｜直接证据：src/bcp/serve.go:40-75；src/internal/backend/memory/queue.go:119-131；src/bcipc/bcipc_test.go:441-496。
++Rubric ID：6｜状态：通过｜期望行为：健康连接继续支持既有顺序复用，普通 Service 方法、显式 Client.Close、客户端 EOF 和连续启动/停止服务的正常结果保持兼容。｜实际观察：Ask 成功完整读写后将健康连接归还池，Close 幂等，Serve 对父 context 取消和 EOF 返回 nil；定向 bcipc/bcp 测试通过。｜直接证据：src/bcipc/bcipc.go:50-74；src/internal/pools/pool.go:96-134；src/bcp/serve.go:60-75。
++Rubric ID：7｜状态：通过｜期望行为：父 context 取消和预期 EOF 安静收敛，真实 listener、协议及网络故障仍返回或记录可观察错误，不以忽略所有 stream 错误来规避挂起。｜实际观察：ServeStream 对父取消或 EOF 返回 nil，对父 context 仍存活的畸形帧返回 readErr；bcipc Serve 只抑制取消、EOF 和 ErrClosed，其他错误记录日志。｜直接证据：src/bcp/serve.go:60-91；src/bcipc/server.go:54-71；src/bcp/bcp_test.go:84-122。
+diff --git a/src/bcipc/bcipc.go b/src/bcipc/bcipc.go
+index 03fa53a..cdd1836 100644
+--- a/src/bcipc/bcipc.go
++++ b/src/bcipc/bcipc.go
+@@ -5,13 +5,15 @@ import (
+ 	"context"
+ 	"fmt"
+ 	"net"
++	"sync/atomic"
+ 
+ 	"blobcache.io/blobcache/src/bcp"
+ 	"blobcache.io/blobcache/src/blobcache"
+ 	"blobcache.io/blobcache/src/internal/pools"
+ )
+ 
+-const MaxMessageLen = 1<<24 + bcp.HeaderLen
++// MaxMessageLen is the largest frame accepted on an IPC connection.
++const MaxMessageLen = bcp.MaxBodyLen + bcp.HeaderLen
+ 
+ var _ bcp.Asker = &clientTransport{}
+ 
+@@ -28,12 +30,46 @@ func (ct *clientTransport) Ask(ctx context.Context, remEp blobcache.Endpoint, re
+ 	if err != nil {
+ 		return err
+ 	}
+-	defer ct.pool.Give(ctx, conn)
++
++	// Once the connection is taken blocking I/O no longer notices
++	// context cancellation on its own.  Close the connection from the
++	// watcher when ctx ends so the write/read below unblocks promptly.
++	var connCanceled atomic.Bool
++	stop := make(chan struct{})
++	stopped := make(chan struct{})
++	go func() {
++		defer close(stopped)
++		select {
++		case <-ctx.Done():
++			connCanceled.Store(true)
++			_ = conn.Close()
++		case <-stop:
++		}
++	}()
++
++	// The connection is reusable only when the full request/response
++	// cycle completed without interruption.  Stop the watcher and wait
++	// for it before returning the connection, so it can never be closed
++	// out from under the next call that reuses it.
++	healthy := false
++	defer func() {
++		close(stop)
++		<-stopped
++		_ = ct.pool.Give(conn, healthy && !connCanceled.Load())
++	}()
++
+ 	if _, err := req.WriteTo(conn); err != nil {
++		if cerr := ctx.Err(); cerr != nil {
++			return cerr
++		}
+ 		return err
+ 	}
+ 	if _, err := resp.ReadFrom(conn); err != nil {
++		if cerr := ctx.Err(); cerr != nil {
++			return cerr
++		}
+ 		return err
+ 	}
++	healthy = true
+ 	return nil
+ }
+diff --git a/src/bcipc/bcipc_test.go b/src/bcipc/bcipc_test.go
+index a661716..36838f2 100644
+--- a/src/bcipc/bcipc_test.go
++++ b/src/bcipc/bcipc_test.go
+@@ -2,8 +2,12 @@ package bcipc
+ 
+ import (
+ 	"context"
++	"fmt"
++	"io"
++	"net"
+ 	"os"
+ 	"path/filepath"
++	"sync"
+ 	"testing"
+ 	"time"
+ 
+@@ -11,6 +15,7 @@ import (
+ 	"blobcache.io/blobcache/src/bcp"
+ 	"blobcache.io/blobcache/src/blobcache"
+ 	"blobcache.io/blobcache/src/blobcache/blobcachetests"
++	"blobcache.io/blobcache/src/internal/pools"
+ 	"blobcache.io/blobcache/src/internal/testutil"
+ 	"github.com/stretchr/testify/require"
+ 	"golang.org/x/sync/errgroup"
+@@ -20,15 +25,20 @@ import (
+ 
+ func waitForSocket(ctx context.Context, t testing.TB, sockPath string) {
+ 	t.Helper()
+-	timeoutCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
++	timeoutCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+ 	defer cancel()
+ 
+ 	tick := time.NewTicker(10 * time.Millisecond)
+ 	defer tick.Stop()
+ 	for {
+-		if _, err := os.Stat(sockPath); err == nil {
++		// A successful dial proves the listener is actually accepting;
++		// the socket file alone can exist briefly before listen is
++		// ready or while a dead socket file lingers.
++		if c, err := net.DialTimeout("unix", sockPath, time.Second); err == nil {
++			_ = c.Close()
+ 			return
+-		} else if !os.IsNotExist(err) {
++		}
++		if _, err := os.Stat(sockPath); err != nil && !os.IsNotExist(err) {
+ 			require.NoError(t, err)
+ 			return
+ 		}
+@@ -48,8 +58,10 @@ func TestService(t *testing.T) {
+ 		ctx := testutil.Context(t)
+ 		ctx, cancel := context.WithCancel(ctx)
+ 
+-		dir := t.TempDir()
+-		sockPath := filepath.Join(dir, "bcipc-test.sock")
++		// Keep the socket path short: deep subtest names plus the OS
++		// temp dir can exceed the UNIX socket path length limit if the
++		// socket is created in t.TempDir().
++		sockPath := tempSockPath(t)
+ 		svc := bclocal.NewTestService(t)
+ 
+ 		var eg errgroup.Group
+@@ -72,3 +84,412 @@ func TestService(t *testing.T) {
+ 		return client
+ 	})
+ }
++
++// tempSockPath returns a path short enough for UNIX sockets (on macOS
++// SUN_LEN is limited to 104 bytes, while t.TempDir() plus a long test
++// name can exceed that).
++func tempSockPath(t testing.TB) string {
++	t.Helper()
++	dir, err := os.MkdirTemp("", "bcipc-test-")
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = os.RemoveAll(dir) })
++	return filepath.Join(dir, "s")
++}
++
++// startServing listens on a fresh socket, serves h, and returns the
++// socket path together with a wait function that reports Serve's return
++// value (or times out).
++func startServing(t testing.TB, ctx context.Context, h bcp.Handler) (string, func() error) {
++	t.Helper()
++	sockPath := tempSockPath(t)
++	lis, err := Listen(sockPath)
++	require.NoError(t, err)
++	done := make(chan error, 1)
++	go func() {
++		done <- Serve(ctx, lis, h)
++	}()
++	waitForSocket(ctx, t, sockPath)
++	wait := func() error {
++		select {
++		case err := <-done:
++			return err
++		case <-time.After(5 * time.Second):
++			return fmt.Errorf("bcipc: Serve did not return in time")
++		}
++	}
++	return sockPath, wait
++}
++
++// pingHandler answers MT_PING with MT_OK; every other code gets a wire
++// error, but the connection stays usable.
++type pingHandler struct{}
++
++func (pingHandler) ServeBCP(ctx context.Context, from blobcache.Endpoint, req bcp.Message, resp *bcp.Message) bool {
++	if req.Header().Code() != bcp.MT_PING {
++		resp.SetError(fmt.Errorf("unexpected message code: %v", req.Header().Code()))
++		return true
++	}
++	resp.SetCode(bcp.MT_OK)
++	resp.SetBody(nil)
++	return true
++}
++
++// gateHandler blocks MT_PING until its handler context ends, and signals
++// start/finish.  Other codes are answered immediately.
++type gateHandler struct {
++	started  chan struct{}
++	finished chan struct{}
++}
++
++func (h *gateHandler) ServeBCP(ctx context.Context, from blobcache.Endpoint, req bcp.Message, resp *bcp.Message) bool {
++	resp.SetCode(bcp.MT_OK)
++	resp.SetBody(nil)
++	if req.Header().Code() == bcp.MT_PING {
++		close(h.started)
++		<-ctx.Done()
++		close(h.finished)
++	}
++	return true
++}
++
++func waitSignal(t testing.TB, ch <-chan struct{}, msg string) {
++	t.Helper()
++	select {
++	case <-ch:
++	case <-time.After(5 * time.Second):
++		t.Fatal(msg)
++	}
++}
++
++// ask sends one raw request and returns the response code.
++func ask(ctx context.Context, asker bcp.Asker, code bcp.MessageCode) (bcp.MessageCode, error) {
++	var req, resp bcp.Message
++	req.SetCode(code)
++	if err := asker.Ask(ctx, blobcache.Endpoint{}, req, &resp); err != nil {
++		return 0, err
++	}
++	return resp.Header().Code(), nil
++}
++
++// Canceling the service context must stop Serve even while a client
++// keeps an idle connection pooled.
++func TestServeStopsWithIdleConnInPool(t *testing.T) {
++	t.Parallel()
++	ctx, cancel := context.WithCancel(testutil.Context(t))
++
++	sockPath, waitServe := startServing(t, ctx, pingHandler{})
++	client := NewClient(sockPath)
++
++	code, err := ask(ctx, &client.tp, bcp.MT_PING)
++	require.NoError(t, err)
++	require.Equal(t, bcp.MT_OK, code)
++	require.Equal(t, 1, client.pool.Len())
++
++	cancel()
++	require.NoError(t, waitServe())
++	require.NoError(t, client.Close())
++}
++
++// A call whose context is canceled after it took a connection must end
++// promptly, the blocked server handler must also end, and a following
++// normal request must succeed over a fresh connection.
++func TestAskCanceledDuringBlockingRequest(t *testing.T) {
++	t.Parallel()
++	ctx := testutil.Context(t)
++	h := &gateHandler{started: make(chan struct{}), finished: make(chan struct{})}
++	sockPath, _ := startServing(t, ctx, h)
++	client := NewClient(sockPath)
++	t.Cleanup(func() { _ = client.Close() })
++
++	callCtx, callCancel := context.WithCancel(ctx)
++	errCh := make(chan error, 1)
++	go func() {
++		_, err := ask(callCtx, &client.tp, bcp.MT_PING)
++		errCh <- err
++	}()
++
++	waitSignal(t, h.started, "server handler never started")
++	callCancel()
++
++	select {
++	case err := <-errCh:
++		require.ErrorIs(t, err, context.Canceled)
++	case <-time.After(5 * time.Second):
++		t.Fatal("Ask did not unblock after context cancellation")
++	}
++	waitSignal(t, h.finished, "blocked server handler outlived the canceled caller")
++
++	// Recovery: new request on a fresh connection succeeds.
++	code, err := ask(ctx, &client.tp, bcp.MT_ENDPOINT)
++	require.NoError(t, err)
++	require.Equal(t, bcp.MT_OK, code)
++}
++
++// Close must tear down idle and in-flight connections, be idempotent,
++// unblock blocked calls, and refuse further Take/Give resurrection.
++func TestClientCloseLifecycle(t *testing.T) {
++	t.Parallel()
++	ctx := testutil.Context(t)
++	h := &gateHandler{started: make(chan struct{}), finished: make(chan struct{})}
++	sockPath, _ := startServing(t, ctx, h)
++	client := NewClient(sockPath)
++
++	// Warm an idle pooled connection.
++	_, err := ask(ctx, &client.tp, bcp.MT_ENDPOINT)
++	require.NoError(t, err)
++	require.Equal(t, 1, client.pool.Len())
++
++	errCh := make(chan error, 1)
++	go func() {
++		_, err := ask(ctx, &client.tp, bcp.MT_PING)
++		errCh <- err
++	}()
++	waitSignal(t, h.started, "server handler never started")
++
++	closeErr := make(chan error, 1)
++	go func() { closeErr <- client.Close() }()
++	select {
++	case err := <-closeErr:
++		require.NoError(t, err)
++	case <-time.After(5 * time.Second):
++		t.Fatal("Client.Close blocked while a call was in flight")
++	}
++	select {
++	case err := <-errCh:
++		// The force-closed connection fails the blocked call rather than
++		// leaving it stuck.
++		require.Error(t, err)
++	case <-time.After(5 * time.Second):
++		t.Fatal("in-flight call was not unblocked by Client.Close")
++	}
++	waitSignal(t, h.finished, "server handler outlived Client.Close")
++
++	// Repeated Close is a quiet no-op.
++	require.NoError(t, client.Close())
++
++	// Further calls fail deterministically and never reopen the pool.
++	_, err = ask(ctx, &client.tp, bcp.MT_ENDPOINT)
++	require.ErrorIs(t, err, pools.ErrClosed)
++}
++
++// A connection returned to a pool while it is closing must be closed,
++// never left in the freelist.
++func TestGiveRacesClose(t *testing.T) {
++	t.Parallel()
++	ctx := testutil.Context(t)
++	sockPath, _ := startServing(t, ctx, pingHandler{})
++
++	for range 50 {
++		client := NewClient(sockPath)
++		_, err := ask(ctx, &client.tp, bcp.MT_ENDPOINT)
++		require.NoError(t, err)
++		conn, err := client.pool.Take(ctx)
++		require.NoError(t, err)
++
++		var wg sync.WaitGroup
++		wg.Add(2)
++		go func() {
++			defer wg.Done()
++			_ = client.pool.Give(conn, true)
++		}()
++		go func() {
++			defer wg.Done()
++			_ = client.Close()
++		}()
++		wg.Wait()
++
++		require.Zero(t, client.pool.Len())
++		_, err = client.pool.Take(ctx)
++		require.ErrorIs(t, err, pools.ErrClosed)
++		// The leased connection is closed regardless of which goroutine won.
++		_, err = conn.Write([]byte("x"))
++		require.Error(t, err)
++	}
++}
++
++// A frame claiming an oversized body is protocol damage: the server must
++// close the offending connection, while a different client's calls keep
++// working.
++func TestOversizedFrameClosesConn(t *testing.T) {
++	t.Parallel()
++	ctx := testutil.Context(t)
++	sockPath, _ := startServing(t, ctx, pingHandler{})
++	client := NewClient(sockPath)
++	t.Cleanup(func() { _ = client.Close() })
++
++	raw, err := net.Dial("unix", sockPath)
++	require.NoError(t, err)
++	var hdr bcp.MessageHeader
++	hdr.SetCode(bcp.MT_PING)
++	hdr.SetBodyLen(bcp.MaxBodyLen + 1)
++	_, err = raw.Write(hdr[:])
++	require.NoError(t, err)
++	require.NoError(t, raw.SetReadDeadline(time.Now().Add(5*time.Second)))
++	buf := make([]byte, 1)
++	n, err := raw.Read(buf)
++	require.Equal(t, 0, n)
++	require.ErrorIs(t, err, io.EOF)
++	require.NoError(t, raw.Close())
++
++	// Recovery: the legitimate client (own connection) still works.
++	code, err := ask(ctx, &client.tp, bcp.MT_PING)
++	require.NoError(t, err)
++	require.Equal(t, bcp.MT_OK, code)
++}
++
++// An in-band error reply keeps framing synchronized, so the connection
++// stays healthy in the pool and serves following requests.
++func TestSemanticErrorKeepsConnectionHealthy(t *testing.T) {
++	t.Parallel()
++	ctx := testutil.Context(t)
++	sockPath, _ := startServing(t, ctx, pingHandler{})
++	client := NewClient(sockPath)
++	t.Cleanup(func() { _ = client.Close() })
++
++	for range 2 {
++		code, err := ask(ctx, &client.tp, bcp.MessageCode(0x00FE))
++		require.NoError(t, err)
++		require.True(t, code.IsError())
++		require.Equal(t, 1, client.pool.Len())
++	}
++	code, err := ask(ctx, &client.tp, bcp.MT_PING)
++	require.NoError(t, err)
++	require.Equal(t, bcp.MT_OK, code)
++	require.Equal(t, 1, client.pool.Len())
++}
++
++// Repeatedly starting and stopping the service on the same socket path
++// must succeed deterministically.
++func TestServeRestart(t *testing.T) {
++	t.Parallel()
++	base := testutil.Context(t)
++	sockPath := tempSockPath(t)
++
++	for range 3 {
++		ctx, cancel := context.WithCancel(base)
++		lis, err := Listen(sockPath)
++		require.NoError(t, err)
++		done := make(chan error, 1)
++		go func() { done <- Serve(ctx, lis, pingHandler{}) }()
++		waitForSocket(base, t, sockPath)
++
++		client := NewClient(sockPath)
++		code, err := ask(base, &client.tp, bcp.MT_PING)
++		require.NoError(t, err)
++		require.Equal(t, bcp.MT_OK, code)
++		require.NoError(t, client.Close())
++
++		cancel()
++		select {
++		case err := <-done:
++			require.NoError(t, err)
++		case <-time.After(5 * time.Second):
++			t.Fatal("Serve did not stop")
++		}
++		_, err = os.Stat(sockPath)
++		require.True(t, os.IsNotExist(err), "socket file should be unlinked when the listener closes")
++	}
++}
++
++// Closing the listener externally (without context cancellation) is a
++// real error and must remain observable.
++func TestServeReturnsAcceptError(t *testing.T) {
++	t.Parallel()
++	ctx := testutil.Context(t)
++	sockPath := tempSockPath(t)
++	lis, err := Listen(sockPath)
++	require.NoError(t, err)
++	done := make(chan error, 1)
++	go func() { done <- Serve(ctx, lis, pingHandler{}) }()
++	waitForSocket(ctx, t, sockPath)
++
++	require.NoError(t, lis.Close())
++	select {
++	case err := <-done:
++		require.Error(t, err)
++	case <-time.After(5 * time.Second):
++		t.Fatal("Serve did not return after the listener was closed")
++	}
++}
++
++// dequeueWatcher reports when a dequeue handler started and when it
++// returned due to context cancellation.
++type dequeueWatcher struct {
++	bcp.Handler
++	started  chan struct{}
++	finished chan struct{}
++
++	startOnce  sync.Once
++	finishOnce sync.Once
++}
++
++func (w *dequeueWatcher) ServeBCP(ctx context.Context, ep blobcache.Endpoint, req bcp.Message, resp *bcp.Message) bool {
++	isDequeue := req.Header().Code() == bcp.MT_QUEUE_DEQUEUE
++	if isDequeue {
++		w.startOnce.Do(func() { close(w.started) })
++	}
++	ok := w.Handler.ServeBCP(ctx, ep, req, resp)
++	if isDequeue && ctx.Err() != nil {
++		w.finishOnce.Do(func() { close(w.finished) })
++	}
++	return ok
++}
++
++// Canceling a blocked Dequeue must end the server-side waiter before a
++// later message is enqueued, so the canceled request cannot consume it;
++// the following dequeue then deterministically receives the message.
++func TestDequeueCanceledDoesNotConsume(t *testing.T) {
++	t.Parallel()
++	ctx := testutil.Context(t)
++	svc := bclocal.NewTestService(t)
++	watcher := &dequeueWatcher{
++		Handler:  NewServer(svc),
++		started:  make(chan struct{}),
++		finished: make(chan struct{}),
++	}
++	sockPath, _ := startServing(t, ctx, watcher)
++	client := NewClient(sockPath)
++	t.Cleanup(func() { _ = client.Close() })
++
++	qh, err := client.CreateQueue(ctx, nil, blobcache.QueueSpec{
++		Memory: &blobcache.QueueBackend_Memory{
++			MaxDepth:             16,
++			MaxBytesPerMessage:   1024,
++			MaxHandlesPerMessage: 16,
++		},
++	})
++	require.NoError(t, err)
++
++	dctx, dcancel := context.WithCancel(ctx)
++	defer dcancel()
++	errCh := make(chan error, 1)
++	go func() {
++		buf := make([]blobcache.Message, 1)
++		_, err := client.Dequeue(dctx, *qh, buf, blobcache.DequeueOpts{Min: 1})
++		errCh <- err
++	}()
++	waitSignal(t, watcher.started, "dequeue handler never started")
++
++	dcancel()
++	select {
++	case err := <-errCh:
++		require.ErrorIs(t, err, context.Canceled)
++	case <-time.After(5 * time.Second):
++		t.Fatal("blocked Dequeue did not return after cancellation")
++	}
++	waitSignal(t, watcher.finished, "server-side dequeue waiter outlived cancellation")
++
++	_, err = client.Enqueue(ctx, *qh, []blobcache.Message{{Bytes: []byte("survives")}})
++	require.NoError(t, err)
++
++	buf := make([]blobcache.Message, 1)
++	n, err := client.Dequeue(ctx, *qh, buf, blobcache.DequeueOpts{Min: 1})
++	require.NoError(t, err)
++	require.Equal(t, 1, n)
++	require.Equal(t, []byte("survives"), buf[0].Bytes)
++
++	// Nothing lingers in the queue behind the canceled waiter.
++	n, err = client.Dequeue(ctx, *qh, buf, blobcache.DequeueOpts{})
++	require.NoError(t, err)
++	require.Equal(t, 0, n)
++}
+diff --git a/src/bcipc/client.go b/src/bcipc/client.go
+index 606853b..4c7eefb 100644
+--- a/src/bcipc/client.go
++++ b/src/bcipc/client.go
+@@ -17,7 +17,7 @@ var _ blobcache.Service = &Client{}
+ type Client struct {
+ 	raddr net.UnixAddr
+ 
+-	pool pools.OpenClose[*net.UnixConn]
++	pool *pools.OpenClose[*net.UnixConn]
+ 	tp   clientTransport
+ 
+ 	cache *lru.Cache[blobcache.OID, *blobcache.TxInfo]
+@@ -26,7 +26,12 @@ type Client struct {
+ func NewClient(sockPath string) *Client {
+ 	raddr := net.UnixAddr{Name: sockPath, Net: "unix"}
+ 	open := func(ctx context.Context) (*net.UnixConn, error) {
+-		return net.DialUnix("unix", nil, &raddr)
++		var d net.Dialer
++		c, err := d.DialContext(ctx, "unix", raddr.Name)
++		if err != nil {
++			return nil, err
++		}
++		return c.(*net.UnixConn), nil
+ 	}
+ 	closeConn := func(conn *net.UnixConn) error {
+ 		return conn.Close()
+@@ -35,14 +40,18 @@ func NewClient(sockPath string) *Client {
+ 	cache, _ := lru.New[blobcache.OID, *blobcache.TxInfo](128)
+ 	return &Client{
+ 		raddr: raddr,
+-		pool:  pool,
++		pool:  &pool,
+ 		tp:    clientTransport{pool: &pool},
+ 		cache: cache,
+ 	}
+ }
+ 
++// Close closes the client: all idle pooled connections and all
++// connections leased by calls in flight are closed, which also unblocks
++// calls blocked in I/O.  It is safe to call concurrently with calls and
++// to call repeatedly.
+ func (c *Client) Close() error {
+-	return c.pool.CloseAll()
++	return c.pool.Close()
+ }
+ 
+ // Endpoint returns the endpoint of the remote service.
+diff --git a/src/bcipc/server.go b/src/bcipc/server.go
+index a6f9248..a2837b1 100644
+--- a/src/bcipc/server.go
++++ b/src/bcipc/server.go
+@@ -2,13 +2,15 @@ package bcipc
+ 
+ import (
+ 	"context"
++	"errors"
++	"io"
+ 	"net"
++	"sync"
+ 
+ 	"blobcache.io/blobcache/src/bcp"
+ 	"blobcache.io/blobcache/src/blobcache"
+ 	"go.brendoncarroll.net/stdctx/logctx"
+ 	"go.uber.org/zap"
+-	"golang.org/x/sync/errgroup"
+ )
+ 
+ func Listen(p string) (*net.UnixListener, error) {
+@@ -25,35 +27,84 @@ func ListenAndServe(ctx context.Context, p string, srv bcp.Handler) error {
+ 	return Serve(ctx, lis, srv)
+ }
+ 
++// Serve accepts connections on lis and serves BCP until ctx is canceled
++// or Accept fails.
++//
++// When ctx is canceled the listener and every accepted connection are
++// closed, including connections clients have left idle in a pool:
++// in-flight handler contexts are canceled and blocked I/O is unblocked.
++// Serve therefore returns in bounded time, with nil, after cancellation.
++// A client EOF or an induced closed-connection error also converges
++// quietly.  Genuine listener, protocol and network errors are returned
++// (per-connection errors are logged) and remain observable.
+ func Serve(ctx context.Context, lis *net.UnixListener, srv bcp.Handler) error {
+-	ctx, cf := context.WithCancel(ctx)
+-	defer cf()
+-	eg, ctx := errgroup.WithContext(ctx)
+-	defer eg.Wait()
++	ctx, cancel := context.WithCancel(ctx)
++	conns := &connTracker{}
++	var wg sync.WaitGroup
++	defer wg.Wait()
++	defer cancel()
+ 
+ 	go func() {
+ 		<-ctx.Done()
+ 		_ = lis.Close()
++		conns.closeAll()
+ 	}()
+ 
+ 	for {
+ 		uc, err := lis.AcceptUnix()
+ 		if err != nil {
+-			if ctx.Err() == err {
++			if ctx.Err() != nil {
+ 				return nil
+ 			}
+ 			return err
+ 		}
+-		eg.Go(func() error {
++		conns.add(uc)
++		wg.Go(func() {
++			defer conns.remove(uc)
+ 			defer uc.Close()
+ 			if err := bcp.ServeStream(ctx, blobcache.Endpoint{}, uc, srv); err != nil {
+-				logctx.Error(ctx, "while serving:", zap.Error(err))
++				if ctx.Err() == nil &&
++					!errors.Is(err, io.EOF) &&
++					!errors.Is(err, net.ErrClosed) {
++					logctx.Error(ctx, "while serving:", zap.Error(err))
++				}
+ 			}
+-			return nil
+ 		})
+ 	}
+ }
+ 
++// connTracker tracks accepted connections so they can all be closed on
++// shutdown.
++type connTracker struct {
++	mu    sync.Mutex
++	conns map[*net.UnixConn]struct{}
++}
++
++func (t *connTracker) add(c *net.UnixConn) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	if t.conns == nil {
++		t.conns = make(map[*net.UnixConn]struct{})
++	}
++	t.conns[c] = struct{}{}
++}
++
++func (t *connTracker) remove(c *net.UnixConn) {
++	t.mu.Lock()
++	defer t.mu.Unlock()
++	delete(t.conns, c)
++}
++
++func (t *connTracker) closeAll() {
++	t.mu.Lock()
++	conns := t.conns
++	t.conns = make(map[*net.UnixConn]struct{})
++	t.mu.Unlock()
++	for c := range conns {
++		_ = c.Close()
++	}
++}
++
+ type Server = bcp.Server
+ 
+ func NewServer(svc blobcache.Service) *Server {
+diff --git a/src/bcp/bcp_test.go b/src/bcp/bcp_test.go
+index 994b553..a708ae2 100644
+--- a/src/bcp/bcp_test.go
++++ b/src/bcp/bcp_test.go
+@@ -2,7 +2,10 @@ package bcp
+ 
+ import (
+ 	"bytes"
++	"context"
++	"net"
+ 	"testing"
++	"time"
+ 
+ 	"blobcache.io/blobcache/src/blobcache"
+ 	"github.com/stretchr/testify/require"
+@@ -35,11 +38,21 @@ func TestMessageReadWrite(t *testing.T) {
+ 	require.Equal(t, string(m2.Body()), "hello")
+ }
+ 
++func TestMessageRejectsOversizedBody(t *testing.T) {
++	var hdr MessageHeader
++	hdr.SetCode(MT_PING)
++	hdr.SetBodyLen(MaxBodyLen + 1)
++
++	var m Message
++	_, err := m.ReadFrom(bytes.NewReader(hdr[:]))
++	require.ErrorIs(t, err, ErrMessageTooLarge)
++}
++
+ func TestPermissionWireError(t *testing.T) {
+ 	m := Message{}
+ 	err0 := blobcache.ErrPermission{
+-		Handle: blobcache.Handle{OID: blobcache.OID{1}},
+-		Rights: 0x10,
++		Handle:   blobcache.Handle{OID: blobcache.OID{1}},
++		Rights:   0x10,
+ 		Requires: 0x20,
+ 	}
+ 	m.SetError(err0)
+@@ -52,3 +65,140 @@ func TestPermissionWireError(t *testing.T) {
+ 	require.Equal(t, err0.Requires, ep.Requires)
+ 	require.Equal(t, err0.Handle, ep.Handle)
+ }
++
++type streamGateHandler struct {
++	started  chan struct{}
++	finished chan struct{}
++}
++
++func (h *streamGateHandler) ServeBCP(ctx context.Context, from blobcache.Endpoint, req Message, resp *Message) bool {
++	close(h.started)
++	<-ctx.Done()
++	close(h.finished)
++	resp.SetCode(MT_OK)
++	resp.SetBody(nil)
++	return true
++}
++
++// A clean peer EOF converges without an error.
++func TestServeStreamEOFQuiet(t *testing.T) {
++	t.Parallel()
++	a, b := net.Pipe()
++	done := make(chan error, 1)
++	go func() {
++		done <- ServeStream(context.Background(), blobcache.Endpoint{}, b, &streamGateHandler{
++			started: make(chan struct{}), finished: make(chan struct{}),
++		})
++	}()
++	require.NoError(t, a.Close())
++	select {
++	case err := <-done:
++		require.NoError(t, err)
++	case <-time.After(5 * time.Second):
++		t.Fatal("ServeStream did not return after peer EOF")
++	}
++}
++
++// An undeliverable frame is a protocol error and stays observable while
++// the service context is alive.
++func TestServeStreamOversizedFrameObservable(t *testing.T) {
++	t.Parallel()
++	a, b := net.Pipe()
++	done := make(chan error, 1)
++	go func() {
++		done <- ServeStream(context.Background(), blobcache.Endpoint{}, b, &streamGateHandler{
++			started: make(chan struct{}), finished: make(chan struct{}),
++		})
++	}()
++	var hdr MessageHeader
++	hdr.SetCode(MT_PING)
++	hdr.SetBodyLen(MaxBodyLen + 1)
++	_, err := a.Write(hdr[:])
++	require.NoError(t, err)
++	select {
++	case err := <-done:
++		require.ErrorIs(t, err, ErrMessageTooLarge)
++	case <-time.After(5 * time.Second):
++		t.Fatal("ServeStream did not return after an oversized frame")
++	}
++	require.NoError(t, a.Close())
++}
++
++// A handler blocked while its caller disconnects must end with the
++// request context canceled.
++func TestServeStreamHandlerEndsOnPeerClose(t *testing.T) {
++	t.Parallel()
++	a, b := net.Pipe()
++	h := &streamGateHandler{started: make(chan struct{}), finished: make(chan struct{})}
++	done := make(chan error, 1)
++	go func() {
++		done <- ServeStream(context.Background(), blobcache.Endpoint{}, b, h)
++	}()
++
++	var req Message
++	req.SetCode(MT_PING)
++	req.SetBody(nil)
++	_, err := req.WriteTo(a)
++	require.NoError(t, err)
++	select {
++	case <-h.started:
++	case <-time.After(5 * time.Second):
++		t.Fatal("handler never started")
++	}
++
++	require.NoError(t, a.Close())
++	select {
++	case <-h.finished:
++	case <-time.After(5 * time.Second):
++		t.Fatal("blocked handler outlived the closed peer")
++	}
++	select {
++	case err := <-done:
++		require.NoError(t, err)
++	case <-time.After(5 * time.Second):
++		t.Fatal("ServeStream did not return after peer close")
++	}
++}
++
++// When the parent context is canceled, the connection is closed and
++// ServeStream returns, even while the peer stays open.
++func TestServeStreamStopsWithParentContext(t *testing.T) {
++	t.Parallel()
++	a, b := net.Pipe()
++	ctx, cancel := context.WithCancel(context.Background())
++	h := &streamGateHandler{started: make(chan struct{}), finished: make(chan struct{})}
++	done := make(chan error, 1)
++	go func() {
++		done <- ServeStream(ctx, blobcache.Endpoint{}, b, h)
++	}()
++
++	var req Message
++	req.SetCode(MT_PING)
++	req.SetBody(nil)
++	_, err := req.WriteTo(a)
++	require.NoError(t, err)
++	select {
++	case <-h.started:
++	case <-time.After(5 * time.Second):
++		t.Fatal("handler never started")
++	}
++
++	cancel()
++	select {
++	case <-h.finished:
++	case <-time.After(5 * time.Second):
++		t.Fatal("blocked handler outlived the canceled parent context")
++	}
++	select {
++	case err := <-done:
++		require.NoError(t, err)
++	case <-time.After(5 * time.Second):
++		t.Fatal("ServeStream did not return after parent context cancellation")
++	}
++	// The peer observes the closed connection (done implies the server
++	// end was closed, so this read cannot block).
++	one := make([]byte, 1)
++	n, err := a.Read(one)
++	require.Equal(t, 0, n)
++	require.Error(t, err)
++}
+diff --git a/src/bcp/message.go b/src/bcp/message.go
+index 2fcb42a..025e4da 100644
+--- a/src/bcp/message.go
++++ b/src/bcp/message.go
+@@ -3,12 +3,22 @@ package bcp
+ import (
+ 	"encoding/binary"
+ 	"encoding/json"
++	"errors"
+ 	"fmt"
+ 	"io"
+ 
+ 	"blobcache.io/blobcache/src/blobcache"
+ )
+ 
++// MaxBodyLen is the largest accepted message body.  It bounds the
++// allocation a corrupted or malicious length prefix can trigger.
++const MaxBodyLen = 1 << 24
++
++// ErrMessageTooLarge is returned when a message frame declares a body
++// longer than MaxBodyLen.  The connection carrying such a frame must be
++// closed, since its framing can no longer be trusted.
++var ErrMessageTooLarge = errors.New("bcp: message too large")
++
+ type MessageCode uint16
+ 
+ // ObjectType is the first 8 bits on the wire
+@@ -190,8 +200,17 @@ func (m *Message) Body() []byte {
+ }
+ 
+ func (m *Message) WriteTo(w io.Writer) (int64, error) {
+-	_, err := w.Write(m.buf)
+-	return int64(len(m.buf)), err
++	var n int
++	// Handle writers allowed to return short writes with a nil error,
++	// such as QUIC streams.  A partial frame would desync the receiver.
++	for n < len(m.buf) {
++		n2, err := w.Write(m.buf[n:])
++		n += n2
++		if err != nil {
++			return int64(n), err
++		}
++	}
++	return int64(n), nil
+ }
+ 
+ func (m *Message) ReadFrom(r io.Reader) (int64, error) {
+@@ -202,6 +221,9 @@ func (m *Message) ReadFrom(r io.Reader) (int64, error) {
+ 	}
+ 	m.buf = append(m.buf, header[:]...)
+ 	bodyLen := header.BodyLen()
++	if bodyLen > MaxBodyLen {
++		return 0, fmt.Errorf("%w: body length %d exceeds maximum %d", ErrMessageTooLarge, bodyLen, MaxBodyLen)
++	}
+ 	m.buf = extendToLen(m.buf, len(m.buf)+bodyLen)
+ 	if _, err := io.ReadFull(r, m.buf[HeaderLen:]); err != nil {
+ 		return 0, err
+diff --git a/src/bcp/serve.go b/src/bcp/serve.go
+index dcea236..ed71e23 100644
+--- a/src/bcp/serve.go
++++ b/src/bcp/serve.go
+@@ -15,21 +15,99 @@ type Handler interface {
+ }
+ 
+ // ServeStream serves BCP over a bidi-stream
++//
++// The context passed to the handler is a child of ctx which is canceled
++// when ctx is canceled, the peer disconnects, or an undeliverable frame
++// is received.  As a result a request blocked inside the handler (for
++// example a long-poll Dequeue) ends as soon as its caller goes away or
++// the service stops, instead of lingering and consuming backend state.
++//
++// BCP requests on a stream are strictly sequential.  While a handler is
++// running a dedicated reader is blocked waiting for the next frame, so
++// a peer close (EOF/reset) is observed even while the handler is blocked.
+ func ServeStream(ctx context.Context, ep blobcache.Endpoint, conn io.ReadWriteCloser, srv Handler) error {
+-	var req, resp Message
++	parentCtx := ctx
++	ctx, cancel := context.WithCancel(ctx)
++	defer cancel()
++
++	requests := make(chan Message)
++	var readErr error
++	var readerWG sync.WaitGroup
++	readerWG.Add(1)
++	go func() {
++		defer readerWG.Done()
++		defer close(requests)
++		for {
++			var req Message
++			if _, err := req.ReadFrom(conn); err != nil {
++				// Peer gone, frame truncated/oversized, or conn closed by
++				// shutdown: cancel any in-flight handler and stop reading.
++				readErr = err
++				cancel()
++				return
++			}
++			select {
++			case requests <- req:
++			case <-ctx.Done():
++				return
++			}
++		}
++	}()
++	// On exit make sure the reader is unblocked and reaped, so neither
++	// the goroutine nor the connection outlives the stream.
++	defer func() {
++		cancel()
++		_ = conn.Close()
++		readerWG.Wait()
++	}()
++
++	var resp Message
+ 	for {
+-		if _, err := req.ReadFrom(conn); err != nil {
+-			if errors.Is(err, io.EOF) {
++		select {
++		case <-ctx.Done():
++			// Service shutdown closes the connection via the deferred
++			// Close, unblocking the reader.  If only the child context
++			// ended (the reader hit an error with the parent still
++			// alive), surface that error instead of masking it: a clean
++			// EOF stays quiet, a frame/network error is returned.
++			if parentCtx.Err() != nil {
+ 				return nil
+ 			}
+-			return err
+-		}
+-		if srv.ServeBCP(ctx, ep, req, &resp) {
+-			if _, err := resp.WriteTo(conn); err != nil {
+-				return err
++			readerWG.Wait()
++			if errors.Is(readErr, io.EOF) {
++				return nil
++			}
++			return readErr
++		case req, ok := <-requests:
++			if !ok {
++				// A clean peer EOF, or a read failure induced by the
++				// caller shutting down, converges quietly.  Frame and
++				// network errors while the parent context is alive are
++				// returned to the caller so they stay observable.
++				if errors.Is(readErr, io.EOF) || parentCtx.Err() != nil {
++					return nil
++				}
++				return readErr
++			}
++			if srv.ServeBCP(ctx, ep, req, &resp) {
++				// The caller is already gone or the service is stopping:
++				// do not block writing a response nobody will receive.
++				if ctx.Err() != nil {
++					return nil
++				}
++				if _, err := resp.WriteTo(conn); err != nil {
++					// The peer went away while the response was being
++					// written: converge quietly rather than surfacing
++					// the induced write failure.
++					if ctx.Err() != nil {
++						return nil
++					}
++					return err
++				}
++			} else {
++				// Handler refuses to serve this peer: hang up immediately.
++				return nil
+ 			}
+-		} else {
+-			return conn.Close()
+ 		}
+ 	}
+ }
+diff --git a/src/internal/backend/memory/queue.go b/src/internal/backend/memory/queue.go
+index 04b5143..916747e 100644
+--- a/src/internal/backend/memory/queue.go
++++ b/src/internal/backend/memory/queue.go
+@@ -116,11 +116,17 @@ func (q *Queue) Dequeue(ctx context.Context, buf []blobcache.Message, opts blobc
+ 			case <-done:
+ 			}
+ 		}()
+-		for len(q.msgs) < min {
++		for {
++			// Check cancellation before availability after waking: a
++			// waiter whose context has ended must not consume messages
++			// that arrived in the same wakeup.
+ 			if err := waitCtx.Err(); err != nil {
+ 				close(done)
+ 				return err
+ 			}
++			if len(q.msgs) >= min {
++				break
++			}
+ 			q.cond.Wait()
+ 		}
+ 		close(done)
+diff --git a/src/internal/pools/pool.go b/src/internal/pools/pool.go
+index 1ce7f0b..b8d3bfe 100644
+--- a/src/internal/pools/pool.go
++++ b/src/internal/pools/pool.go
+@@ -3,57 +3,135 @@ package pools
+ import (
+ 	"context"
+ 	"errors"
++	"sync"
+ )
+ 
++// ErrClosed is returned by Take when the pool has been closed.
++var ErrClosed = errors.New("pools: pool is closed")
++
+ // OpenClose is a pool of resources which have
+ // an open and close cost to be amoritized by staying in the pool.
+-type OpenClose[T any] struct {
++//
++// A resource is either idle (in the freelist) or leased (taken by a
++// caller and not yet returned).  Close closes resources in both states,
++// and it is safe to run concurrently with Take and Give.
++type OpenClose[T comparable] struct {
++	mu       sync.Mutex
+ 	freelist chan T
+-	mk       func(context.Context) (T, error)
+-	close    func(T) error
++	leased   map[T]struct{}
++	closed   bool
++
++	mk      func(context.Context) (T, error)
++	closeFn func(T) error
+ }
+ 
+-func NewOpenClose[T any](n int, mk func(ctx context.Context) (T, error), close func(T) error) OpenClose[T] {
++func NewOpenClose[T comparable](n int, mk func(ctx context.Context) (T, error), closeFn func(T) error) OpenClose[T] {
+ 	return OpenClose[T]{
+ 		freelist: make(chan T, n),
++		leased:   make(map[T]struct{}),
+ 		mk:       mk,
+-		close:    close,
++		closeFn:  closeFn,
+ 	}
+ }
+ 
++// Take returns an idle resource, or opens a new one.
++// It returns ErrClosed if the pool is closed.
+ func (p *OpenClose[T]) Take(ctx context.Context) (T, error) {
++	var zero T
++
++	p.mu.Lock()
++	if p.closed {
++		p.mu.Unlock()
++		return zero, ErrClosed
++	}
+ 	select {
+-	case <-ctx.Done():
+-		var zero T
+-		return zero, ctx.Err()
+ 	case x := <-p.freelist:
++		p.leased[x] = struct{}{}
++		p.mu.Unlock()
+ 		return x, nil
+ 	default:
+-		return p.mk(ctx)
+ 	}
++	p.mu.Unlock()
++
++	x, err := p.mk(ctx)
++	if err != nil {
++		return zero, err
++	}
++
++	p.mu.Lock()
++	if p.closed {
++		p.mu.Unlock()
++		_ = p.closeFn(x)
++		return zero, ErrClosed
++	}
++	p.leased[x] = struct{}{}
++	p.mu.Unlock()
++	return x, nil
+ }
+ 
+-func (p *OpenClose[T]) Give(ctx context.Context, x T) error {
++// Give returns a leased resource to the pool.
++//
++// If healthy is false the resource is closed instead of being reused,
++// so canceled, timed-out, corrupted and failed I/O connections cannot
++// pollute later calls.  Resources returned after Close are also closed.
++// Give never blocks.
++func (p *OpenClose[T]) Give(x T, healthy bool) error {
++	p.mu.Lock()
++	defer p.mu.Unlock()
++	delete(p.leased, x)
++	if !healthy || p.closed {
++		return p.closeFn(x)
++	}
++	// The decision and the channel send must be atomic against Close,
++	// otherwise Close can drain the freelist in between and the resource
++	// gets resurrected after the pool is closed.
+ 	select {
+-	case <-ctx.Done():
+-		return ctx.Err()
+ 	case p.freelist <- x:
+ 		return nil
+ 	default:
+-		return p.close(x)
++		return p.closeFn(x)
+ 	}
+ }
+ 
+-func (p *OpenClose[T]) CloseAll() (retErr error) {
++// Close marks the pool closed and closes every resource it currently
++// holds, both idle and leased.  Leased resources are closed even while
++// their callers may still be blocked in I/O, which unblocks those
++// callers.  Resources opened or returned concurrently with Close are
++// closed by Take/Give instead of leaking into the freelist.
++//
++// Close is idempotent.
++func (p *OpenClose[T]) Close() (retErr error) {
++	p.mu.Lock()
++	if p.closed {
++		p.mu.Unlock()
++		return nil
++	}
++	p.closed = true
++
++	idle := make([]T, 0, len(p.freelist))
++drain:
+ 	for {
+ 		select {
+ 		case x := <-p.freelist:
+-			err := p.close(x)
+-			retErr = errors.Join(retErr, err)
++			idle = append(idle, x)
+ 		default:
+-			return retErr
++			break drain
+ 		}
+ 	}
++	leased := make([]T, 0, len(p.leased))
++	for x := range p.leased {
++		leased = append(leased, x)
++	}
++	clear(p.leased)
++	p.mu.Unlock()
++
++	for _, x := range idle {
++		retErr = errors.Join(retErr, p.closeFn(x))
++	}
++	for _, x := range leased {
++		retErr = errors.Join(retErr, p.closeFn(x))
++	}
++	return retErr
+ }
+ 
+ func (p *OpenClose[T]) Len() int {

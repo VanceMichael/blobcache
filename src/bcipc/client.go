@@ -17,7 +17,7 @@ var _ blobcache.Service = &Client{}
 type Client struct {
 	raddr net.UnixAddr
 
-	pool pools.OpenClose[*net.UnixConn]
+	pool *pools.OpenClose[*net.UnixConn]
 	tp   clientTransport
 
 	cache *lru.Cache[blobcache.OID, *blobcache.TxInfo]
@@ -26,7 +26,12 @@ type Client struct {
 func NewClient(sockPath string) *Client {
 	raddr := net.UnixAddr{Name: sockPath, Net: "unix"}
 	open := func(ctx context.Context) (*net.UnixConn, error) {
-		return net.DialUnix("unix", nil, &raddr)
+		var d net.Dialer
+		c, err := d.DialContext(ctx, "unix", raddr.Name)
+		if err != nil {
+			return nil, err
+		}
+		return c.(*net.UnixConn), nil
 	}
 	closeConn := func(conn *net.UnixConn) error {
 		return conn.Close()
@@ -35,14 +40,18 @@ func NewClient(sockPath string) *Client {
 	cache, _ := lru.New[blobcache.OID, *blobcache.TxInfo](128)
 	return &Client{
 		raddr: raddr,
-		pool:  pool,
+		pool:  &pool,
 		tp:    clientTransport{pool: &pool},
 		cache: cache,
 	}
 }
 
+// Close closes the client: all idle pooled connections and all
+// connections leased by calls in flight are closed, which also unblocks
+// calls blocked in I/O.  It is safe to call concurrently with calls and
+// to call repeatedly.
 func (c *Client) Close() error {
-	return c.pool.CloseAll()
+	return c.pool.Close()
 }
 
 // Endpoint returns the endpoint of the remote service.

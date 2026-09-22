@@ -3,11 +3,21 @@ package bcp
 import (
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 
 	"blobcache.io/blobcache/src/blobcache"
 )
+
+// MaxBodyLen is the largest accepted message body.  It bounds the
+// allocation a corrupted or malicious length prefix can trigger.
+const MaxBodyLen = 1 << 24
+
+// ErrMessageTooLarge is returned when a message frame declares a body
+// longer than MaxBodyLen.  The connection carrying such a frame must be
+// closed, since its framing can no longer be trusted.
+var ErrMessageTooLarge = errors.New("bcp: message too large")
 
 type MessageCode uint16
 
@@ -190,8 +200,17 @@ func (m *Message) Body() []byte {
 }
 
 func (m *Message) WriteTo(w io.Writer) (int64, error) {
-	_, err := w.Write(m.buf)
-	return int64(len(m.buf)), err
+	var n int
+	// Handle writers allowed to return short writes with a nil error,
+	// such as QUIC streams.  A partial frame would desync the receiver.
+	for n < len(m.buf) {
+		n2, err := w.Write(m.buf[n:])
+		n += n2
+		if err != nil {
+			return int64(n), err
+		}
+	}
+	return int64(n), nil
 }
 
 func (m *Message) ReadFrom(r io.Reader) (int64, error) {
@@ -202,6 +221,9 @@ func (m *Message) ReadFrom(r io.Reader) (int64, error) {
 	}
 	m.buf = append(m.buf, header[:]...)
 	bodyLen := header.BodyLen()
+	if bodyLen > MaxBodyLen {
+		return 0, fmt.Errorf("%w: body length %d exceeds maximum %d", ErrMessageTooLarge, bodyLen, MaxBodyLen)
+	}
 	m.buf = extendToLen(m.buf, len(m.buf)+bodyLen)
 	if _, err := io.ReadFull(r, m.buf[HeaderLen:]); err != nil {
 		return 0, err

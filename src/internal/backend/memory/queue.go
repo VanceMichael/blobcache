@@ -116,10 +116,16 @@ func (q *Queue) Dequeue(ctx context.Context, buf []blobcache.Message, opts blobc
 			case <-done:
 			}
 		}()
-		for len(q.msgs) < min {
+		for {
+			// Check cancellation before availability after waking: a
+			// waiter whose context has ended must not consume messages
+			// that arrived in the same wakeup.
 			if err := waitCtx.Err(); err != nil {
 				close(done)
 				return err
+			}
+			if len(q.msgs) >= min {
+				break
 			}
 			q.cond.Wait()
 		}
