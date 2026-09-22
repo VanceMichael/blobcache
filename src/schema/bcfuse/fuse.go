@@ -2,6 +2,8 @@ package bcfuse
 
 import (
 	"context"
+	"errors"
+	"io"
 	"syscall"
 
 	"blobcache.io/blobcache/src/bcsdk"
@@ -35,30 +37,82 @@ var _ fs.NodeCreater = (*Node[string])(nil)
 var _ fs.NodeUnlinker = (*Node[string])(nil)
 var _ fs.NodeReader = (*Node[string])(nil)
 var _ fs.NodeWriter = (*Node[string])(nil)
+var _ fs.NodeFlusher = (*Node[string])(nil)
+var _ fs.NodeFsyncer = (*Node[string])(nil)
+var _ fs.NodeReleaser = (*Node[string])(nil)
+
+const (
+	modeDirDefault  = fuse.S_IFDIR | 0755
+	modeFileDefault = fuse.S_IFREG | 0644
+)
 
 // Getattr returns file attributes
 func (n *Node[K]) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	// Get the scheme ID for this inode
-	id, exists := n.fs.GetID(n.ino)
-	if !exists && n.ino != 1 {
-		return syscall.ENOENT
-	}
-
-	// Set basic attributes
-	out.Attr.Ino = uint64(n.ino)
-	out.Attr.Mode = fuse.S_IFDIR | 0755 // Default to directory
-	out.Attr.Nlink = 2
-
-	// For root directory, we know it's a directory
+	// Root directory is always known.
 	if n.ino == 1 {
-		out.Attr.Mode = fuse.S_IFDIR | 0755
+		out.Attr.Ino = 1
+		out.Attr.Mode = modeDirDefault
+		out.Attr.Nlink = 2
 		return 0
 	}
 
-	// For other nodes, we could query the scheme for more info
-	_ = id // Use the scheme ID for future lookups
+	id, exists := n.fs.GetID(n.ino)
+	if !exists {
+		return syscall.ENOENT
+	}
 
+	mode := n.fs.getInodeMode(n.ino)
+
+	// Begin read transaction
+	tx, err := bcsdk.BeginTx(ctx, n.fs.svc, n.fs.vol, blobcache.TxParams{Modify: false})
+	if err != nil {
+		return syscall.EIO
+	}
+	defer func() { _ = tx.Abort(ctx) }()
+
+	info, present, err := n.fs.scheme.StatFile(ctx, tx, n.fs.currentRoot(), id)
+	if err != nil {
+		return syscall.EIO
+	}
+	if !present {
+		// A buffered file not yet committed: size comes from the buffer.
+		size, serr := n.fs.FileSize(ctx, id)
+		if serr != nil {
+			return syscall.EIO
+		}
+		if size == 0 {
+			return syscall.ENOENT
+		}
+		out.Attr.Ino = uint64(n.ino)
+		out.Attr.Mode = firstMode(mode, modeFileDefault)
+		out.Attr.Nlink = 1
+		out.Attr.Size = uint64(size)
+		return 0
+	}
+
+	if mode == 0 {
+		mode = info.Mode
+	}
+	out.Attr.Ino = uint64(n.ino)
+	out.Attr.Mode = mode
+	out.Attr.Nlink = 1
+	if mode&fuse.S_IFDIR != 0 {
+		out.Attr.Nlink = 2
+	} else {
+		size, serr := n.fs.FileSize(ctx, id)
+		if serr != nil {
+			return syscall.EIO
+		}
+		out.Attr.Size = uint64(size)
+	}
 	return 0
+}
+
+func firstMode(mode, fallback uint32) uint32 {
+	if mode != 0 {
+		return mode
+	}
+	return fallback
 }
 
 // Lookup finds a child node by name
@@ -76,13 +130,6 @@ func (n *Node[K]) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (
 	}
 
 	// Begin read transaction
-	txh, err := n.fs.svc.BeginTx(ctx, n.fs.vol, blobcache.TxParams{Modify: false})
-	if err != nil {
-		return nil, syscall.EIO
-	}
-	defer func() { _ = n.fs.svc.Abort(ctx, *txh) }()
-
-	// Create transaction wrapper
 	tx, err := bcsdk.BeginTx(ctx, n.fs.svc, n.fs.vol, blobcache.TxParams{Modify: false})
 	if err != nil {
 		return nil, syscall.EIO
@@ -90,7 +137,7 @@ func (n *Node[K]) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (
 	defer func() { _ = tx.Abort(ctx) }()
 
 	// Read directory entries from the scheme
-	entries, err := n.fs.scheme.ReadDir(ctx, tx, n.fs.root, id)
+	entries, err := n.fs.scheme.ReadDir(ctx, tx, n.fs.currentRoot(), id)
 	if err != nil {
 		return nil, syscall.EIO
 	}
@@ -99,7 +146,7 @@ func (n *Node[K]) Lookup(ctx context.Context, name string, out *fuse.EntryOut) (
 	for _, entry := range entries {
 		if entry.Name == name {
 			// Get or create inode for this child
-			childIno := n.fs.GetOrCreateInode(entry.Child)
+			childIno := n.fs.touchInode(entry.Child, entry.Mode)
 
 			// Set attributes for the entry
 			out.Attr.Ino = uint64(childIno)
@@ -144,7 +191,7 @@ func (n *Node[K]) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	defer func() { _ = tx.Abort(ctx) }()
 
 	// Read directory entries from the scheme
-	entries, err := n.fs.scheme.ReadDir(ctx, tx, n.fs.root, id)
+	entries, err := n.fs.scheme.ReadDir(ctx, tx, n.fs.currentRoot(), id)
 	if err != nil {
 		return nil, syscall.EIO
 	}
@@ -152,7 +199,7 @@ func (n *Node[K]) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 	// Convert to FUSE directory entries
 	var fuseEntries []fuse.DirEntry
 	for _, entry := range entries {
-		childIno := n.fs.GetOrCreateInode(entry.Child)
+		childIno := n.fs.touchInode(entry.Child, entry.Mode)
 		fuseEntries = append(fuseEntries, fuse.DirEntry{
 			Name: entry.Name,
 			Ino:  uint64(childIno),
@@ -165,6 +212,9 @@ func (n *Node[K]) Readdir(ctx context.Context) (fs.DirStream, syscall.Errno) {
 
 // Create creates a new file
 func (n *Node[K]) Create(ctx context.Context, name string, flags uint32, mode uint32, out *fuse.EntryOut) (node *fs.Inode, fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
+	if n.fs.readOnly {
+		return nil, nil, 0, syscall.EROFS
+	}
 	// Get the scheme ID for this directory
 	id, exists := n.fs.GetID(n.ino)
 	if !exists && n.ino != 1 {
@@ -185,7 +235,7 @@ func (n *Node[K]) Create(ctx context.Context, name string, flags uint32, mode ui
 	defer func() { _ = tx.Abort(ctx) }()
 
 	// Create the file in the scheme
-	childID, newRoot, err := n.fs.scheme.CreateAt(ctx, tx, tx, n.fs.root, id, name, mode)
+	childID, newRoot, err := n.fs.scheme.CreateAt(ctx, tx, tx, n.fs.currentRoot(), id, name, mode)
 	if err != nil {
 		return nil, nil, 0, syscall.EIO
 	}
@@ -199,10 +249,15 @@ func (n *Node[K]) Create(ctx context.Context, name string, flags uint32, mode ui
 	}
 
 	// Update the root
+	n.fs.mu.Lock()
 	n.fs.root = newRoot
+	n.fs.mu.Unlock()
 
 	// Create inode for the new file
-	childIno := n.fs.GetOrCreateInode(childID)
+	if mode == 0 {
+		mode = modeFileDefault
+	}
+	childIno := n.fs.touchInode(childID, mode)
 
 	// Set attributes
 	out.Attr.Ino = uint64(childIno)
@@ -225,6 +280,9 @@ func (n *Node[K]) Create(ctx context.Context, name string, flags uint32, mode ui
 
 // Unlink removes a file
 func (n *Node[K]) Unlink(ctx context.Context, name string) syscall.Errno {
+	if n.fs.readOnly {
+		return syscall.EROFS
+	}
 	// Get the scheme ID for this directory
 	id, exists := n.fs.GetID(n.ino)
 	if !exists && n.ino != 1 {
@@ -245,7 +303,7 @@ func (n *Node[K]) Unlink(ctx context.Context, name string) syscall.Errno {
 	defer func() { _ = tx.Abort(ctx) }()
 
 	// Delete the file from the scheme
-	newRoot, err := n.fs.scheme.DeleteAt(ctx, tx, tx, n.fs.root, id, name)
+	newRoot, err := n.fs.scheme.DeleteAt(ctx, tx, tx, n.fs.currentRoot(), id, name)
 	if err != nil {
 		return syscall.EIO
 	}
@@ -259,12 +317,14 @@ func (n *Node[K]) Unlink(ctx context.Context, name string) syscall.Errno {
 	}
 
 	// Update the root
+	n.fs.mu.Lock()
 	n.fs.root = newRoot
+	n.fs.mu.Unlock()
 
 	return 0
 }
 
-// Read reads file data
+// Read reads file data, overlaying buffered uncommitted extents.
 func (n *Node[K]) Read(ctx context.Context, f fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	// Get the scheme ID for this file
 	id, exists := n.fs.GetID(n.ino)
@@ -272,32 +332,18 @@ func (n *Node[K]) Read(ctx context.Context, f fs.FileHandle, dest []byte, off in
 		return nil, syscall.ENOENT
 	}
 
-	// Begin read transaction
-	tx, err := bcsdk.BeginTx(ctx, n.fs.svc, n.fs.vol, blobcache.TxParams{Modify: false})
-	if err != nil {
-		return nil, syscall.EIO
-	}
-	defer func() { _ = tx.Abort(ctx) }()
-
-	// Read from the scheme
 	buf := make([]byte, len(dest))
-	bytesRead, err := n.fs.scheme.ReadFile(ctx, tx, n.fs.root, id, buf)
-	if err != nil {
+	n2, err := n.fs.ReadFile(ctx, id, buf, off)
+	if err != nil && !(errors.Is(err, io.EOF) && n2 == 0) {
 		return nil, syscall.EIO
 	}
-
-	// Handle offset and length
-	if off >= int64(bytesRead) {
+	if n2 == 0 {
 		return fuse.ReadResultData([]byte{}), 0
 	}
-
-	end := off + int64(len(dest))
-	end = min(end, int64(bytesRead))
-
-	return fuse.ReadResultData(buf[off:end]), 0
+	return fuse.ReadResultData(buf[:n2]), 0
 }
 
-// Write writes file data
+// Write writes file data into the extent buffer.
 func (n *Node[K]) Write(ctx context.Context, f fs.FileHandle, data []byte, off int64) (written uint32, errno syscall.Errno) {
 	// Get the scheme ID for this file
 	id, exists := n.fs.GetID(n.ino)
@@ -308,8 +354,46 @@ func (n *Node[K]) Write(ctx context.Context, f fs.FileHandle, data []byte, off i
 	// Write to the extent buffer
 	err := n.fs.PutExtent(ctx, id, off, data)
 	if err != nil {
-		return 0, syscall.EIO
+		return 0, errnoForWrite(err)
 	}
 
 	return uint32(len(data)), 0
+}
+
+// Flush is invoked on close(2) of a file descriptor. Buffered extents are
+// committed to the volume and only confirmed once the commit succeeds.
+func (n *Node[K]) Flush(ctx context.Context, f fs.FileHandle) syscall.Errno {
+	return commitErrno(n.fs.Flush(ctx))
+}
+
+// Fsync commits buffered extents to the volume.
+func (n *Node[K]) Fsync(ctx context.Context, f fs.FileHandle, flags uint32) syscall.Errno {
+	return commitErrno(n.fs.Flush(ctx))
+}
+
+// Release is invoked when the last reference to an open file is dropped and
+// performs the same commit as fsync/close.
+func (n *Node[K]) Release(ctx context.Context, f fs.FileHandle) syscall.Errno {
+	return commitErrno(n.fs.Flush(ctx))
+}
+
+func errnoForWrite(err error) syscall.Errno {
+	switch {
+	case errors.Is(err, ErrReadOnly):
+		return syscall.EROFS
+	case errors.Is(err, ErrClosed):
+		return syscall.EIO
+	default:
+		return syscall.EIO
+	}
+}
+
+func commitErrno(err error) syscall.Errno {
+	if err == nil {
+		return 0
+	}
+	if errors.Is(err, ErrReadOnly) {
+		return syscall.EROFS
+	}
+	return syscall.EIO
 }

@@ -7,10 +7,11 @@ package bcfuse
 
 import (
 	"context"
-	"fmt"
+	"errors"
+	"sort"
 	"sync"
+	"time"
 
-	"blobcache.io/blobcache/src/bcsdk"
 	"blobcache.io/blobcache/src/blobcache"
 	"blobcache.io/blobcache/src/internal/sqlutil"
 	"blobcache.io/blobcache/src/schema"
@@ -21,11 +22,21 @@ import (
 // All reading methods follow the pattern: func(ctx context.Context, src schema.RO, root []byte, ...) (..., error)
 // All writing methods follow the pattern: func(ctx context.Context, dst schema.WO, src schema.RO, root []byte, ...) (..., []byte, error)
 type Scheme[K comparable] interface {
-	// FlushExtents writes all the extents to the volume.
+	// FlushExtents writes the extents in one committed batch to the volume.
+	// Extents for the same file identifier are sorted by offset and do not
+	// overlap: they represent a complete overlay on top of the file as it
+	// exists at root.
 	FlushExtents(ctx context.Context, dst schema.WO, src schema.RO, root []byte, extents []Extent[K]) ([]byte, error)
 
-	// ReadFile reads a file from the volume by identifier into the provided buffer
-	ReadFile(ctx context.Context, src schema.RO, root []byte, id K, buf []byte) (int, error)
+	// ReadFileAt reads up to len(dst) bytes of a file starting at off.
+	// It returns the number of bytes placed in dst and the total committed
+	// size of the file. A file which does not exist reads as empty: n == 0,
+	// size == 0 and no error.
+	ReadFileAt(ctx context.Context, src schema.RO, root []byte, id K, dst []byte, off int64) (n int, size int64, err error)
+
+	// StatFile returns committed information about a file or directory.
+	// exists is false when the identifier is not present in the tree.
+	StatFile(ctx context.Context, src schema.RO, root []byte, id K) (info FileInfo, exists bool, err error)
 
 	// ReadDir reads directory entries for the given identifier
 	ReadDir(ctx context.Context, src schema.RO, root []byte, id K) ([]DirEntry[K], error)
@@ -51,6 +62,34 @@ type DirEntry[K comparable] struct {
 	Mode  uint32
 }
 
+// FileInfo describes a committed filesystem object.
+type FileInfo struct {
+	Size int64
+	Mode uint32
+}
+
+var (
+	// ErrReadOnly is returned when a write is attempted against a filesystem
+	// mounted without write access.
+	ErrReadOnly = errors.New("bcfuse: filesystem is mounted read-only")
+	// ErrClosed is returned after the filesystem has been shut down.
+	ErrClosed = errors.New("bcfuse: filesystem is closed")
+)
+
+// Option configures an FS at construction.
+type Option[K comparable] func(*FS[K])
+
+// WithReadOnly mounts the filesystem without accepting writes or commits.
+func WithReadOnly[K comparable]() Option[K] {
+	return func(fs *FS[K]) { fs.readOnly = true }
+}
+
+// inodeEntry is the in-memory counterpart of a POSIX inode.
+type inodeEntry[K comparable] struct {
+	id   K
+	mode uint32
+}
+
 // FS represents the filesystem with thread-safe operations
 type FS[K comparable] struct {
 	db     *sqlx.DB
@@ -58,110 +97,179 @@ type FS[K comparable] struct {
 	vol    blobcache.Handle
 	scheme Scheme[K]
 
+	readOnly bool
+
 	// rootNode is set the first time FUSERoot is called
 	rootNode *Node[K]
 
-	mu sync.RWMutex
+	// commitMu serializes volume commits (flush/fsync/release/shutdown and
+	// mount-time recovery that performs work).
+	commitMu sync.Mutex
+
+	mu sync.Mutex
 	// Root bytes held in memory (<1MB)
 	root []byte
+	// closed is set by Shutdown; afterwards writes are rejected.
+	closed bool
+	// activeBatch is the batch accepting new writes, or 0 when the current
+	// batch has been frozen by an in-flight commit.
+	activeBatch int64
+	// knownCommitted batches durably committed to the volume whose local
+	// confirmation may still be incomplete. They must never be applied again,
+	// even if the durable state update has not landed yet.
+	knownCommitted map[int64]struct{}
 	// Inode management
 	nextInode int64
 	// Bidirectional mapping between POSIX inodes and scheme identifiers
-	inodeToID map[int64]K
+	inodeToID map[int64]*inodeEntry[K]
 	idToInode map[K]int64
 }
 
-// New creates a new filesystem instance
-func New[K comparable](db *sqlx.DB, svc blobcache.Service, vol blobcache.Handle, scheme Scheme[K]) *FS[K] {
-	return &FS[K]{
-		db:        db,
-		svc:       svc,
-		vol:       vol,
-		scheme:    scheme,
-		nextInode: 2, // Start at 2 since 1 is reserved for root
-		inodeToID: make(map[int64]K),
-		idToInode: make(map[K]int64),
+// New creates a new filesystem instance.
+// Init must be called before the filesystem is mounted.
+func New[K comparable](db *sqlx.DB, svc blobcache.Service, vol blobcache.Handle, scheme Scheme[K], opts ...Option[K]) *FS[K] {
+	fs := &FS[K]{
+		db:             db,
+		svc:            svc,
+		vol:            vol,
+		scheme:         scheme,
+		nextInode:      2, // Start at 2 since 1 is reserved for root
+		knownCommitted: make(map[int64]struct{}),
+		inodeToID:      make(map[int64]*inodeEntry[K]),
+		idToInode:      make(map[K]int64),
 	}
+	for _, opt := range opts {
+		opt(fs)
+	}
+	return fs
 }
 
-// Flush writes all pending extents to the volume
-func (fs *FS[K]) Flush(ctx context.Context) error {
-	fs.mu.Lock()
-	defer fs.mu.Unlock()
-
-	// Get all extents from the database
-	extents, err := fs.getAllExtents(ctx)
-	if err != nil {
-		return fmt.Errorf("failed to get extents: %w", err)
+// PutExtent buffers data at startAt for the file identified by id.
+// Overlapping writes overwrite earlier bytes; adjacent and overlapping extents
+// are coalesced. Sparse (non-adjacent) writes stay separate and read back as
+// zero-filled holes. The data is durable in the local database before the
+// method returns.
+func (fs *FS[K]) PutExtent(ctx context.Context, id K, startAt int64, data []byte) error {
+	if startAt < 0 {
+		return errors.New("bcfuse: negative write offset")
 	}
-
-	if len(extents) == 0 {
+	if len(data) == 0 {
 		return nil
 	}
-
-	// Begin a write transaction
-	tx, err := bcsdk.BeginTx(ctx, fs.svc, fs.vol, blobcache.TxParams{Modify: true})
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer func() { _ = tx.Abort(ctx) }()
-
-	// Load current root
-	if err := tx.Load(ctx, &fs.root); err != nil {
-		return fmt.Errorf("failed to load root: %w", err)
-	}
-
-	// Flush extents to the volume
-	newRoot, err := fs.scheme.FlushExtents(ctx, tx, tx, fs.root, extents)
-	if err != nil {
-		return fmt.Errorf("failed to flush extents: %w", err)
-	}
-
-	// Commit the transaction with the new root
-	if err := tx.Save(ctx, newRoot); err != nil {
-		return fmt.Errorf("failed to save root: %w", err)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("failed to commit transaction: %w", err)
-	}
-
-	fs.root = newRoot
-
-	// Clear the extents table after successful flush
-	return fs.clearExtents(ctx)
-}
-
-// PutExtent writes data to the extent table.
-// Any overlapping extents are truncated so that they are non-overlapping.
-func (fs *FS[K]) PutExtent(ctx context.Context, id K, startAt int64, data []byte) error {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
-
-	endAt := startAt + int64(len(data))
-	return sqlutil.DoTx(ctx, fs.db, func(tx *sqlx.Tx) error {
-		// Remove overlapping extents
-		_, err := tx.Exec(`
-			DELETE FROM extents
-			WHERE id = ? AND (
-				(start < ? AND "end" > ?) OR
-				(start >= ? AND start < ?)
-			)
-		`, id, endAt, startAt, startAt, endAt)
+	if fs.closed {
+		return ErrClosed
+	}
+	if fs.readOnly {
+		return ErrReadOnly
+	}
+	if fs.activeBatch == 0 {
+		batchID, err := fs.createBatch(ctx)
 		if err != nil {
 			return err
 		}
+		fs.activeBatch = batchID
+	}
+	batchID := fs.activeBatch
+	return fs.mergeExtent(ctx, batchID, id, startAt, data)
+}
 
-		// Insert the new extent
-		_, err = tx.Exec(`INSERT INTO extents (id, start, "end", data) VALUES (?, ?, ?, ?)`,
-			id, startAt, endAt, data)
-		return err
+// createBatch allocates a new pending batch. The caller holds fs.mu.
+func (fs *FS[K]) createBatch(ctx context.Context) (int64, error) {
+	var id int64
+	err := sqlutil.DoTx(ctx, fs.db, func(tx *sqlx.Tx) error {
+		return tx.GetContext(ctx, &id,
+			`INSERT INTO batches (state, created_at) VALUES (?, ?) RETURNING id`,
+			batchPending, time.Now().UnixNano())
 	})
+	return id, err
+}
+
+// mergeExtent folds one write into the buffered extents of a batch/file.
+// The caller holds fs.mu, which makes the read-modify-write atomic with
+// respect to concurrent writes.
+func (fs *FS[K]) mergeExtent(ctx context.Context, batchID int64, id K, startAt int64, data []byte) error {
+	return sqlutil.DoTx(ctx, fs.db, func(tx *sqlx.Tx) error {
+		rows, err := tx.QueryxContext(ctx,
+			`SELECT start, "end", data FROM extents WHERE batch_id = ? AND id = ? ORDER BY start`,
+			batchID, id)
+		if err != nil {
+			return err
+		}
+		var existing []seg
+		for rows.Next() {
+			var s, e int64
+			var d []byte
+			if err := rows.Scan(&s, &e, &d); err != nil {
+				rows.Close()
+				return err
+			}
+			existing = append(existing, seg{start: s, end: e, data: d})
+		}
+		if err := rows.Err(); err != nil {
+			rows.Close()
+			return err
+		}
+		rows.Close()
+
+		merged := mergeSegs(existing, seg{start: startAt, end: startAt + int64(len(data)), data: data})
+
+		if _, err := tx.ExecContext(ctx,
+			`DELETE FROM extents WHERE batch_id = ? AND id = ?`, batchID, id); err != nil {
+			return err
+		}
+		for _, s := range merged {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO extents (batch_id, id, start, "end", data) VALUES (?, ?, ?, ?, ?)`,
+				batchID, id, s.start, s.end, s.data); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// seg is an in-memory half-open byte interval [start, end).
+type seg struct {
+	start, end int64
+	data       []byte
+}
+
+// mergeSegs folds incoming segments over dst. Inputs are ordered by offset and
+// later segments win on overlap (the input order is preserved for equal
+// starts, so callers pass newer segments after older ones). Adjacent and
+// overlapping segments are coalesced; gaps are preserved.
+func mergeSegs(dst []seg, incoming ...seg) []seg {
+	all := append(append([]seg{}, dst...), incoming...)
+	sort.SliceStable(all, func(i, j int) bool {
+		return all[i].start < all[j].start
+	})
+	var out []seg
+	for _, s := range all {
+		if len(out) == 0 || s.start > out[len(out)-1].end {
+			out = append(out, seg{start: s.start, end: s.end, data: append([]byte(nil), s.data...)})
+			continue
+		}
+		last := &out[len(out)-1]
+		switch {
+		case s.end <= last.end:
+			copy(last.data[s.start-last.start:], s.data)
+		default:
+			buf := make([]byte, s.end-last.start)
+			copy(buf, last.data)
+			copy(buf[s.start-last.start:], s.data)
+			last.data = buf
+			last.end = s.end
+		}
+	}
+	return out
 }
 
 // GetInode returns the POSIX inode for a scheme identifier
 func (fs *FS[K]) GetInode(id K) int64 {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
 
 	if ino, exists := fs.idToInode[id]; exists {
 		return ino
@@ -172,10 +280,22 @@ func (fs *FS[K]) GetInode(id K) int64 {
 
 // GetOrCreateInode returns the POSIX inode for a scheme identifier, creating one if needed
 func (fs *FS[K]) GetOrCreateInode(id K) int64 {
+	return fs.getOrCreateInode(id, 0)
+}
+
+// touchInode records the mode known from Lookup/Create/Readdir for an inode.
+func (fs *FS[K]) touchInode(id K, mode uint32) int64 {
+	return fs.getOrCreateInode(id, mode)
+}
+
+func (fs *FS[K]) getOrCreateInode(id K, mode uint32) int64 {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
 	if ino, exists := fs.idToInode[id]; exists {
+		if mode != 0 {
+			fs.inodeToID[ino].mode = mode
+		}
 		return ino
 	}
 
@@ -184,53 +304,46 @@ func (fs *FS[K]) GetOrCreateInode(id K) int64 {
 	fs.nextInode++
 
 	fs.idToInode[id] = ino
-	fs.inodeToID[ino] = id
+	fs.inodeToID[ino] = &inodeEntry[K]{id: id, mode: mode}
 
 	return ino
 }
 
 // GetID returns the scheme identifier for a POSIX inode
 func (fs *FS[K]) GetID(ino int64) (K, bool) {
-	fs.mu.RLock()
-	defer fs.mu.RUnlock()
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
 
-	id, exists := fs.inodeToID[ino]
-	return id, exists
+	e, exists := fs.inodeToID[ino]
+	if !exists {
+		var zero K
+		return zero, false
+	}
+	return e.id, true
 }
 
-// getAllExtents retrieves all extents from the database
-func (fs *FS[K]) getAllExtents(ctx context.Context) ([]Extent[K], error) {
-	rows, err := fs.db.QueryxContext(ctx, `SELECT id, start, "end", data FROM extents ORDER BY id, start`)
-	if err != nil {
-		return nil, err
+// getInodeMode returns the recorded POSIX mode for an inode, or 0 if unknown.
+func (fs *FS[K]) getInodeMode(ino int64) uint32 {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if e, ok := fs.inodeToID[ino]; ok {
+		return e.mode
 	}
-	defer rows.Close()
-
-	var extents []Extent[K]
-	for rows.Next() {
-		var id K
-		var start, end int64
-		var data []byte
-
-		err := rows.Scan(&id, &start, &end, &data)
-		if err != nil {
-			return nil, err
-		}
-
-		extents = append(extents, Extent[K]{
-			ID:    id,
-			Start: start,
-			Data:  data,
-		})
-	}
-
-	return extents, rows.Err()
+	return 0
 }
 
-// clearExtents removes all extents from the database
-func (fs *FS[K]) clearExtents(ctx context.Context) error {
-	return sqlutil.DoTx(ctx, fs.db, func(tx *sqlx.Tx) error {
-		_, err := tx.Exec("DELETE FROM extents")
-		return err
-	})
+// currentRoot returns a copy of the last committed root.
+func (fs *FS[K]) currentRoot() []byte {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return append([]byte(nil), fs.root...)
+}
+
+// pendingExtentCount is used by tests and diagnostics.
+func (fs *FS[K]) pendingExtentCount(ctx context.Context) (int, error) {
+	var n int
+	if err := fs.db.GetContext(ctx, &n, `SELECT COUNT(*) FROM extents`); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
